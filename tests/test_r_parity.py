@@ -196,3 +196,14 @@ def test_limma_hyperparameters():
         dp, _, post = _limma.squeeze_var(x, du, **kw)
         _close(post, r[f"p{k}"], rtol=1e-9)
         _close(np.broadcast_to(dp, len(r)), r[f"d{k}"], rtol=1e-9)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_glm_treat(setup, k):
+    X, cond, D = setup
+    y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
+    fit = {1: lambda: pyedger.glmFit(y, D), 2: lambda: pyedger.glmQLFit(y, D, legacy=True), 3: lambda: pyedger.glmQLFit(y, D)}[k]()
+    tab = pyedger.glmTreat(fit, coef=D.shape[1] - 1, lfc=np.log2(1.5)).table
+    r = _read(f"treat{k}.tsv")
+    _close(tab["logFC"], r["logFC"], atol=1e-7)
+    _close(tab["PValue"], r["PValue"], atol=1e-12)

@@ -1147,11 +1147,11 @@ def glm_treat(glmfit: DGEGLM, coef=None, contrast=None, lfc: float = np.log2(1.2
 
     if lfc < 0:
         raise ValueError("lfc must be non-negative.")
-    if lfc == 0:
-        return glm_lrt(glmfit, coef=coef, contrast=contrast)
     if not isinstance(glmfit, DGEGLM):
         raise TypeError("glm_treat expects a DGEGLM from glm_fit.")
     is_lrt = glmfit.df_prior is None
+    if lfc == 0:
+        return (glm_lrt if is_lrt else glm_qlf_test)(glmfit, coef=coef, contrast=contrast)
 
     design = np.asarray(glmfit.design, dtype=float)
     if design.shape[1] < 2:
@@ -1244,6 +1244,7 @@ def glm_treat(glmfit: DGEGLM, coef=None, contrast=None, lfc: float = np.log2(1.2
         scale = np.sqrt(np.asarray(glmfit.s2_post, dtype=float))
         z_left = _zscore_t(z_left / scale, df_total)
         z_right = _zscore_t(z_right / scale, df_total)
+        poisson_bound = glmfit.df_residual_zeros is not None
 
     within = np.abs(unshrunk_logfc) <= lfc
     z_left = z_left * (2.0 * within.astype(float) - 1.0)
@@ -1261,6 +1262,20 @@ def glm_treat(glmfit: DGEGLM, coef=None, contrast=None, lfc: float = np.log2(1.2
         pvals[~use_tail] = 2.0 * _integrate_pnorm(-z_right[~use_tail], z_left[~use_tail])
     else:
         pvals = stats.norm.cdf(-z_right) + stats.norm.cdf(z_left)
+
+    # edgeR: a QL test is never more significant than the Poisson-variance test
+    if not is_lrt and poisson_bound:
+        disp = np.asarray(glmfit.dispersion, dtype=float)
+        disp = np.broadcast_to(disp.reshape(-1, 1) if disp.ndim else disp, glmfit.fitted_values.shape)
+        below = np.any((glmfit.fitted_values * disp + 1) * np.asarray(glmfit.s2_post, dtype=float).reshape(-1, 1) < 1, axis=1)
+        if np.any(below):
+            i = np.flatnonzero(below)
+            pois = glm_fit(glmfit.counts.iloc[i], design=glmfit.design, dispersion=0.0, offset=np.asarray(glmfit.offset)[i],
+                           weights=None if glmfit.weights is None else np.asarray(glmfit.weights)[i],
+                           start=None if glmfit.unshrunk_coefficients is None else glmfit.unshrunk_coefficients[i])
+            pois.coef_names = glmfit.coef_names
+            pres = glm_treat(pois, coef=coef, contrast=contrast, lfc=lfc, null=null)
+            pvals[i] = np.maximum(pvals[i], pres.table["PValue"].to_numpy(dtype=float))
 
     if shrunk:
         table_data = {

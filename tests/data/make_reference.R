@@ -98,3 +98,10 @@ w(data.frame(s1 = rep_len(o[[1]]$scale, n), d1 = o[[1]]$df2.shrunk, s2 = o[[2]]$
              s3 = rep_len(o[[3]]$scale, n), d3 = o[[3]]$df2.shrunk,
              p4 = o[[4]]$var.post, d4 = rep_len(o[[4]]$df.prior, n), p5 = o[[5]]$var.post, d5 = rep_len(o[[5]]$df.prior, n),
              p6 = o[[6]]$var.post, d6 = rep_len(o[[6]]$df.prior, n)), "limma_out.tsv")
+
+# 7) glmTreat on LRT and both QL fits (design path)
+for (k in 1:3) {
+  f <- switch(k, glmFit(yd, D), glmQLFit(yd, D, legacy = TRUE), glmQLFit(yd, D))
+  tr <- glmTreat(f, coef = ncol(D), lfc = log2(1.5))
+  w(data.frame(logFC = tr$table$logFC, PValue = tr$table$PValue), sprintf("treat%d.tsv", k))
+}
