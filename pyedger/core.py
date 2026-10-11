@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -244,6 +245,23 @@ def _calc_factor_quantile(data: np.ndarray, lib_size: np.ndarray, p: float = 0.7
     return np.quantile(data, p, axis=0) / lib_size
 
 
+def _log2_libm(x) -> np.ndarray:
+    """log2 via the C library, as R computes it.
+
+    NumPy's SIMD log2 differs from libm by an ulp on some inputs. TMM trims on
+    ranks of log-ratios that are heavily tied (small integer counts), so an ulp
+    breaks or creates ties at the trim boundary and moves the factor by ~1e-3.
+    The ratios take few distinct values, so evaluating libm on the unique ones
+    is cheap.
+    """
+    x = np.asarray(x, dtype=float)
+    u, inv = np.unique(x, return_inverse=True)
+    out = np.empty(u.size)
+    for i, t in enumerate(u.tolist()):
+        out[i] = math.log2(t) if t > 0 else (-math.inf if t == 0 else math.nan)
+    return out[inv.reshape(x.shape)]
+
+
 def _calc_factor_tmm(
     obs,
     ref,
@@ -257,8 +275,8 @@ def _calc_factor_tmm(
     obs = np.asarray(obs, dtype=float)
     ref = np.asarray(ref, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
-        logR = np.log2((obs / libsize_obs) / (ref / libsize_ref))
-        absE = (np.log2(obs / libsize_obs) + np.log2(ref / libsize_ref)) / 2.0
+        logR = _log2_libm((obs / libsize_obs) / (ref / libsize_ref))
+        absE = (_log2_libm(obs / libsize_obs) + _log2_libm(ref / libsize_ref)) / 2.0
         v = (libsize_obs - obs) / libsize_obs / obs + (libsize_ref - ref) / libsize_ref / ref
     fin = np.isfinite(logR) & np.isfinite(absE) & (absE > Acutoff)
     logR = logR[fin]
