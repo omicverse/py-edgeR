@@ -108,3 +108,15 @@ def test_glm_common_disp(setup):
     y = pyedger.calcNormFactors(pyedger.DGEList(X, group=cond))
     y = pyedger.estimateGLMCommonDisp(y, D.to_numpy())
     _close(y.common_dispersion, _read("glm_common.tsv")["common"][0], rtol=RTOL_COXREID)
+
+
+def test_tmm_tied_log_ratios():
+    # Two pseudobulk ATAC libraries (GSE274113 IRF9 population, KO rep vs TMM
+    # reference column) stored as unique (obs, ref) pairs with multiplicities.
+    # The log-ratios are heavily tied, so an ulp difference between NumPy's
+    # log2 and libm's moves ties across the trim boundary (0.66398 vs R).
+    # R: p <- read.delim("tmm_ties.tsv.gz"); edgeR:::.calcFactorTMM(rep(p$obs, p$n), rep(p$ref, p$n))
+    p = _read("tmm_ties.tsv.gz")
+    obs, ref = np.repeat(p["obs"], p["n"]).to_numpy(float), np.repeat(p["ref"], p["n"]).to_numpy(float)
+    f = pyedger.core._calc_factor_tmm(obs, ref, obs.sum(), ref.sum(), 0.3, 0.05, True, -1e10)
+    _close(f, 0.6646329070011745, rtol=1e-12)
