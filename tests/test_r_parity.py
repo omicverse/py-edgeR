@@ -120,3 +120,16 @@ def test_tmm_tied_log_ratios():
     obs, ref = np.repeat(p["obs"], p["n"]).to_numpy(float), np.repeat(p["ref"], p["n"]).to_numpy(float)
     f = pyedger.core._calc_factor_tmm(obs, ref, obs.sum(), ref.sum(), 0.3, 0.05, True, -1e10)
     _close(f, 0.6646329070011745, rtol=1e-12)
+
+
+def test_infinite_prior_df():
+    # Counts with no extra-Poisson variability between genes: squeezeVar gives
+    # prior.df = Inf, and edgeR then leaves tagwise at the common dispersion
+    # instead of running WLEB (prior.n > 1e6). Previously this produced NaN.
+    # R: y <- estimateDisp(calcNormFactors(DGEList(x, group=g))); glmLRT(glmFit(y), coef=2)
+    d = _read("no_extra_var.tsv")
+    X = d[[f"s{i}" for i in range(6)]]
+    y = pyedger.estimateDisp(pyedger.calcNormFactors(pyedger.DGEList(X, group=["treatment"] * 3 + ["control"] * 3)))
+    assert np.isinf(y.prior_df)
+    _close(y.tagwise_dispersion, d["tagwise"], rtol=1e-9)
+    _close(pyedger.glmLRT(pyedger.glmFit(y), coef="treatment").table["PValue"], d["PValue"], rtol=1e-8)

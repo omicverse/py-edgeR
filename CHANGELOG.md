@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- **`estimateDisp` with infinite prior df:** when the genewise variances show no extra variability, `squeezeVar` returns `prior.df = Inf`. edgeR then skips the weighted-likelihood step (prior.n > 1e6) and leaves the tagwise dispersions at the trend (or common) value; pyedger fed the infinite weight into it and returned NaN tagwise dispersions, so `glmFit`/`glmLRT` gave NaN for every gene. Ported edgeR's handling; regression test `test_infinite_prior_df`. (0.1.0 was not affected because it fixed prior df at 10.)
+
 ## 0.1.2
 
 - **TMM parity fix:** `calcNormFactors(method="TMM")` now takes log2 through the C library, as R does. NumPy's SIMD `log2` differs by an ulp on some inputs, and TMM trims on ranks of heavily tied log-ratios, so the ulp moved ties across the trim boundary. On real pseudobulk ATAC data this shifted a norm factor by ~1e-3 (0.66398 vs R's 0.66463) and with it every downstream statistic; with the fix the 19 GSE274113 population comparisons match edgeR 4.0.16 to ~1e-8 in P-value with identical FDR calls. Regression test: `test_tmm_tied_log_ratios`.
