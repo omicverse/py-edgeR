@@ -230,5 +230,7 @@ def test_glm_treat(setup, k):
     fit = {1: lambda: pyedger.glmFit(y, D), 2: lambda: pyedger.glmQLFit(y, D, legacy=True), 3: lambda: pyedger.glmQLFit(y, D)}[k]()
     tab = pyedger.glmTreat(fit, coef=D.shape[1] - 1, lfc=np.log2(1.5)).table
     r = _read(f"treat{k}.tsv")
-    _close(tab["logFC"], r["logFC"], atol=1e-7)
-    _close(tab["PValue"], r["PValue"], atol=1e-12)
+    # k=3: the new QL method estimates its own Cox-Reid dispersion (RTOL_COXREID)
+    rtol, atol = (RTOL_COXREID, 1e-5) if k == 3 else (RTOL, 1e-7)
+    _close(tab["logFC"], r["logFC"], rtol=rtol, atol=atol)
+    _close(tab["PValue"], r["PValue"], rtol=rtol, atol=1e-12)
