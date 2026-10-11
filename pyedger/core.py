@@ -1708,9 +1708,11 @@ def _squeeze_var(
         dfp = df[np.isfinite(df) & (df > 0)]
         if covariate is None and dfp.size and np.nanmin(dfp) == np.nanmax(dfp):
             return _squeeze_var_robust_equal_df(var, df, winsor_tail_p=winsor_tail_p)
-    if not robust:
+    dfp = df[df > 0]
+    if not robust or (dfp.size and np.min(dfp) != np.max(dfp)):
+        # limma 3.68: unequal residual df use fitFDistUnequalDF1 (robust included)
         from . import _limma
-        return _limma.squeeze_var(var, df, covariate=covariate)
+        return _limma.squeeze_var(var, df, covariate=covariate, robust=robust)
     n = var.size
     if n < 3:
         return 0.0, var.copy(), var.copy()
