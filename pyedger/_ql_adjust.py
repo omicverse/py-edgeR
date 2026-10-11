@@ -1,7 +1,8 @@
-"""NumPy port of edgeR 4.0.16's ``compute_adjust_s2`` (glmQLFit, ``legacy=FALSE``).
+"""NumPy port of edgeR 4.10's new quasi-likelihood adjustments (glmQLFit, ``legacy=FALSE``).
 
-This module reproduces, with floating-point-level parity, the C routine
-``c_compute_adjust_s2`` (src/ql_glm.c) together with everything it calls:
+This module reproduces, with floating-point-level parity, the C routines
+``compute_adj_vec`` / ``compute_adj_mat`` / ``compute_ave_qd`` (src/ql_glm.c)
+together with everything they call:
 
 * ``compute_weight``      -- src/ql_weights.c (Chebyshev approximations of the
   bias (alpha) and variance (kappa) adjustments of the NB unit deviance, plus the
@@ -10,8 +11,13 @@ This module reproduces, with floating-point-level parity, the C routine
 * ``QR_hat``              -- src/qr_hat.c (LINPACK ``dqrdc2`` with tol 1e-7 and
   limited column pivoting, then ``dqrqy`` on the first ``k`` = rank columns)
 
-and R's ``.computePriorS2`` (R/glmQLFTest.R), including an exact port of R's
-``lowess`` (``clowess``) and ``quantile(type=7)``.
+and ``compute_prior`` (the C replacement of ``.computePriorS2``), including an exact
+port of edgeR's copy of R's ``clowess``, ``rsort_with_index`` and its type-7 quantile.
+
+Changes from edgeR 4.0 reproduced here: sample weights enter the working weights,
+``compute_weight`` (via prior/w) and the unit deviance (via phi*w/prior); the
+``compute_weight`` exact branch starts at phi >= 4.001; unit deviances are floored
+at 0; df below 1e-4 is no longer zeroed (only s2 is).
 
 Everything is vectorised across genes.  Hat values are computed with a batched
 Householder reduction that follows ``dqrdc2`` step by step; genes whose weighted
@@ -29,8 +35,8 @@ Notes on faithful reproduction of C quirks
   evident intent of the code).  In practice: phi >= 4 and mu/prior > ~sqrt(2^31/phi)
   (e.g. mu > ~14,650 at phi = 10) crashes R itself.
 
-Numerical parity (vs R 4.3.3 / edgeR 4.0.16 / OpenBLAS)
--------------------------------------------------------
+Numerical parity (measured vs edgeR 4.0.16; the shared kernels are unchanged in 4.10)
+----------------------------------------------------------------------------------
 * ``deviance`` / ``unit_deviance``: bit-identical except in the phi >= 4 branch
   (R's ``dnbinom_mu`` is re-implemented via its nmath algorithm; ~1e-15 relative).
   The NB unit deviance logs go through the platform libm (``math.log``), because

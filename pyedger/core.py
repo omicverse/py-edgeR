@@ -1367,8 +1367,6 @@ def glm_ql_fit(
     from . import _limma
     from ._ql_adjust import compute_adj_mat, compute_adj_vec, compute_ave_qd
 
-    if robust:
-        raise NotImplementedError("Robust QL moderation is not implemented yet.")
     samples = genes = None
     if isinstance(y, DGEList):
         obj = y
@@ -1469,7 +1467,8 @@ def glm_ql_fit(
             fit.unit_deviance_adj = mats["unit_deviance"]
             fit.unit_df_adj = mats["unit_df"]
         fit.top_proportion = top_proportion
-    df_prior, var_prior, var_post = _limma.squeeze_var(s2, df, covariate=covariate, robust=robust, legacy=legacy)
+    df_prior, var_prior, var_post = _limma.squeeze_var(s2, df, covariate=covariate, robust=robust,
+                                                       winsor_tail_p=winsor_tail_p, legacy=legacy)
     fit.df_prior = df_prior
     fit.s2_prior = var_prior
     fit.s2_post = var_post

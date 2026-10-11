@@ -48,6 +48,12 @@ for (legacy in c(TRUE, FALSE)) {
 # new QL straight from counts (no dispersions in the DGEList)
 f <- glmQLFit(y, D)
 ql(f, glmQLFTest(f, coef = ncol(D)), "design_ql_nodisp.tsv")
+for (legacy in c(TRUE, FALSE)) {
+  # robust QL; for legacy = FALSE the dispersion is fixed at the estimated one
+  disp <- if (legacy) NULL else glmQLFit(yd, D)$dispersion
+  f <- glmQLFit(yd, D, legacy = legacy, robust = TRUE, dispersion = disp)
+  ql(f, glmQLFTest(f, coef = ncol(D)), sprintf("design_ql_robust_legacy%d.tsv", legacy))
+}
 f <- glmQLFit(yd, D, top.proportion = 0.2, abundance.trend = FALSE)
 ql(f, glmQLFTest(f, coef = ncol(D)), "design_ql_top02_notrend.tsv")
 
