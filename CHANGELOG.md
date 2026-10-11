@@ -1,0 +1,25 @@
+# Changelog
+
+## 0.1.1
+
+Performance and numerical parity with edgeR 4.0.16.
+
+- **Speed:** GLM fits are vectorised over genes (edgeR's Levenberg algorithm and one-way shortcut), replacing per-gene SciPy BFGS. `estimateDisp` with a design on ~1e5 features went from hours to about a minute.
+- **Parity fixes** (each checked against R; see README):
+  - `estimateDisp` with a design: zero-fitted observations dropped per zero pattern with reduced designs, warm-started grid fits, Cox-Reid adjustment with edgeR's LDL floor, AveLogCPM at the common dispersion, WLEB span, and the spline `maximizeInterpolant`.
+  - `estimateDisp` classic mode: single Brent optimisation from pseudo-counts at dispersion 0.01, as edgeR does (previously `estimateCommonDisp`).
+  - Prior df: residual df adjusted for exact zeros (`.residDF`); `prior_df=None` now estimates it, as in edgeR (was fixed at 10).
+  - `squeezeVar`: the covariate (abundance trend) is now used; this is limma's natural-spline `fitFDist`.
+  - `locfitByCol`: reproduces the locfit package (adaptive tree, vertex fits, interpolation) instead of a direct local regression.
+  - `aveLogCPM`: one-group NB fit with prior counts (was a plain mean of log-CPM).
+  - `glmQLFit(legacy=False)`: edgeR's bias-adjusted deviance and df (`compute_adjust_s2`) and `.computePriorS2`; the common dispersion is estimated on the top 5% of AveLogCPM. `abundance_trend` now defaults to `True`.
+  - `glmLRT`/`glmQLFTest`: the null model uses the working dispersion for the new QL method; the Poisson bound is applied for legacy fits.
+  - `estimateGLMCommonDisp`: Cox-Reid APL maximised with R's Brent `optimize`.
+  - `q2qnbinom` in log space; `mglmOneGroup` as in edgeR; `exactTest` keeps negative pseudo-counts as R does and orders groups by factor level.
+  - `DGEList` keeps a categorical `group`'s level order. A missing `group` means a single group, as in R.
+  - `topTags(sort_by="none")` is supported.
+- Tests: `tests/test_r_parity.py` with R reference values (`tests/data/make_reference.R`).
+
+## 0.1.0
+
+Initial release.
