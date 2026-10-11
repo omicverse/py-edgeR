@@ -171,8 +171,23 @@ def levenberg_start(Y, Off, Phi, W, X):
     return c[:, None] * coef_of_one[None, :]
 
 
+def _full(a, shape):
+    return np.ascontiguousarray(np.broadcast_to(np.asarray(a, dtype=float), shape))
+
+
 def fit_levenberg(Y, Off, Phi, W, X, beta, tol=1e-6, maxit=200):
-    """glm_levenberg.cpp, vectorised across genes. Returns beta, mu, deviance, iter, failed."""
+    """glm_levenberg.cpp per gene. Returns beta, mu, deviance, iter, failed."""
+    from . import _numba_kernels as nk
+    if nk.HAVE_NUMBA:
+        Y = np.ascontiguousarray(Y, dtype=float)
+        X = np.ascontiguousarray(X, dtype=float)
+        return nk.fit_levenberg_nb(Y, _full(Off, Y.shape), _full(Phi, Y.shape), _full(W, Y.shape), X,
+                                   _full(beta, (Y.shape[0], X.shape[1])), float(tol), int(maxit))
+    return _fit_levenberg_np(Y, Off, Phi, W, X, beta, tol=tol, maxit=maxit)
+
+
+def _fit_levenberg_np(Y, Off, Phi, W, X, beta, tol=1e-6, maxit=200):
+    """glm_levenberg.cpp, vectorised across genes (NumPy fallback)."""
     Y = np.asarray(Y, dtype=float)
     n, s = Y.shape
     p = X.shape[1]
@@ -303,7 +318,17 @@ def resid_df(zero, X):
 
 # --------------------------------------------------------------------------- adjusted profile likelihood
 def compute_apl(Y, Mu, Phi, W, X, adjust=True):
-    """R_compute_apl.cpp (vectorised)."""
+    """R_compute_apl.cpp."""
+    from . import _numba_kernels as nk
+    if nk.HAVE_NUMBA:
+        Y = np.ascontiguousarray(Y, dtype=float)
+        return nk.compute_apl_nb(Y, _full(Mu, Y.shape), _full(Phi, Y.shape), _full(W, Y.shape),
+                                 np.ascontiguousarray(X, dtype=float), bool(adjust))
+    return _compute_apl_np(Y, Mu, Phi, W, X, adjust)
+
+
+def _compute_apl_np(Y, Mu, Phi, W, X, adjust=True):
+    """R_compute_apl.cpp (vectorised NumPy fallback)."""
     Y = np.asarray(Y, dtype=float)
     pos = Mu != 0
     w = W
