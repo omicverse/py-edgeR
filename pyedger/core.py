@@ -648,8 +648,9 @@ def estimate_disp(
         return object
     if trend_method in {"movingave", "loess", "locfit", "locfit.mixed"}:
         if span is None:
-            nsel = int(np.sum(sel))   # WLEB default span
-            span = 1.0 if nsel <= 50 else 0.25 + 0.75 * (50.0 / nsel) ** 0.5
+            nsel = int(np.sum(sel))   # WLEB default span (edgeR >= 4.8; legacy_span: edgeR <= 4.6)
+            span = (_choose_lowess_span(nsel, small_n=50, min_span=0.25, power=0.5) if legacy_span
+                    else _choose_lowess_span(nsel))
         if trend_method == "movingave":
             m0 = _moving_average_loglik(l0, ave[sel], span=float(span))
         elif trend_method == "locfit":
