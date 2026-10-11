@@ -113,7 +113,13 @@ def design_as_factor(X):
 
 def mglm_one_group(Y, Off, Phi, W, start=None, maxit=50, tol=1e-10):
     """glm_one_group.cpp (vectorised): returns beta (n,), -inf for all-zero rows."""
+    from . import _numba_kernels as nk
     n, s = Y.shape
+    if nk.HAVE_NUMBA and n:
+        Y = np.ascontiguousarray(Y, dtype=float)
+        st = np.zeros(n) if start is None else np.ascontiguousarray(np.broadcast_to(np.asarray(start, dtype=float), (n,)))
+        return nk.one_group_nb(Y, _full(Off, Y.shape), _full(Phi, Y.shape), _full(W, Y.shape), st,
+                               start is not None, int(maxit), float(tol))
     nonzero = (Y > LOW_VALUE).any(axis=1)
     num = np.where(Y > LOW_VALUE, Y / np.exp(Off) * W, 0.0).sum(axis=1)
     with np.errstate(divide="ignore"):

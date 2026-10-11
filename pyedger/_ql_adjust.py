@@ -1447,6 +1447,19 @@ def _adjust_units(y, mu, X, disp, w, prior):
     return udp * wa, hdp * wk, hat
 
 
+def _numba_adjust(y, mu, X, disp, w, prior, want_mat):
+    """Compiled per-gene path (``_numba_kernels.ql_adjust_nb``); None if unavailable.
+
+    The exact finite-sum weights for phi >= 4.001 are only in the NumPy path;
+    glmQLFit caps the dispersion at 4, so they are not reached from there.
+    """
+    from . import _numba_kernels as nk
+    if not nk.HAVE_NUMBA or y.size == 0 or not (np.max(disp) < 4.001):
+        return None
+    c = lambda a: np.ascontiguousarray(a, dtype=np.float64)
+    return nk.ql_adjust_nb(c(y), c(mu), c(X), c(disp), c(w), float(prior), bool(want_mat))
+
+
 def compute_adj_vec(y, mu, design, dispersion, prior=1.0, weights=None):
     """edgeR 4.10 ``.cxx_compute_adj_vec`` (src/ql_glm.c ``compute_adjust_vec``).
 
@@ -1456,6 +1469,9 @@ def compute_adj_vec(y, mu, design, dispersion, prior=1.0, weights=None):
     """
     y, mu, X, disp, w = _prep(y, mu, design, dispersion, weights)
     prior = float(np.asarray(prior, dtype=np.float64).ravel()[0])
+    nb = _numba_adjust(y, mu, X, disp, w, prior, False)
+    if nb is not None:
+        return {"df": nb[0], "deviance": nb[1], "s2": nb[2]}
     unit_dev, unit_df, _ = _adjust_units(y, mu, X, disp, w, prior)
     G, n = y.shape
     dev = np.zeros(G)
@@ -1473,6 +1489,9 @@ def compute_adj_mat(y, mu, design, dispersion, prior=1.0, weights=None):
     """edgeR 4.10 ``.cxx_compute_adj_mat``: unit df, unit deviance and leverage matrices."""
     y, mu, X, disp, w = _prep(y, mu, design, dispersion, weights)
     prior = float(np.asarray(prior, dtype=np.float64).ravel()[0])
+    nb = _numba_adjust(y, mu, X, disp, w, prior, True)
+    if nb is not None:
+        return {"unit_df": nb[4], "unit_deviance": nb[3], "leverage": nb[5]}
     unit_dev, unit_df, hat = _adjust_units(y, mu, X, disp, w, prior)
     return {"unit_df": unit_df, "unit_deviance": unit_dev, "leverage": hat}
 
@@ -1665,10 +1684,17 @@ def compute_prior(ave_log_cpm, s2, df):
     xx = ag[keep]
     yy = np.sqrt(np.sqrt(s2[keep]))
     k = xx.size
-    o = _rsort_with_index(xx)
-    xs, ys = xx[o], yy[o]
-    delta = 0.01 * (xs[k - 1] - xs[0])
-    ans = np.sort(_clowess(xs, ys, 0.5, 3, delta))
+    from . import _numba_kernels as nk
+    if nk.HAVE_NUMBA:
+        o = nk.rsort_with_index_nb(np.ascontiguousarray(xx))
+        xs, ys = xx[o], yy[o]
+        delta = 0.01 * (xs[k - 1] - xs[0])
+        ans = np.sort(nk.clowess_nb(np.ascontiguousarray(xs), np.ascontiguousarray(ys), 0.5, 3, delta))
+    else:
+        o = _rsort_with_index(xx)
+        xs, ys = xx[o], yy[o]
+        delta = 0.01 * (xs[k - 1] - xs[0])
+        ans = np.sort(_clowess(xs, ys, 0.5, 3, delta))
     m = (k - 1) * 0.9
     lo = int(m)
     h = m - lo
