@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyedger"
-version = "0.2.0"
+version = "0.2.1"
 description = "Pure-Python port of Bioconductor edgeR — negative-binomial models for differential expression of count data (estimateDisp, glmFit, glmLRT, glmQLFTest, exactTest)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,6 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+fast = ["numba>=0.57"]
 dev = ["pytest>=7", "pytest-cov", "ruff"]
 
 [project.urls]
