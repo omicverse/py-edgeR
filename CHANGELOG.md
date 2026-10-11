@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0
+
+pyedger now targets **edgeR 4.10.5 / limma 3.68.5** (Bioconductor 3.23) instead of edgeR 4.0.16. Results change wherever edgeR changed between those releases; parity tests were regenerated with R 4.5.3.
+
+Breaking defaults (as in edgeR >= 4.2/4.8):
+- `glmQLFit(legacy=False)` is the default: the new QL method (Chen, Chen & Smyth 2024) as rewritten in edgeR 4.4+ (`compute_ave_qd` / `compute_adj_vec`; data-driven `top_proportion`; NB dispersion estimated on the top genes; dispersions stored in the DGEList are ignored; preset dispersions capped at 4). `legacy=True` gives the classic method.
+- `estimateDisp` chooses its default span with `chooseLowessSpan(n)`; `legacy_span=True` restores the edgeR <= 4.6 span.
+
+Other changes:
+- limma 3.68 hyperparameter estimation: `squeezeVar` uses `fitFDistUnequalDF1` when residual df are unequal (e.g. zero fits), which changes `estimateDisp`'s `prior.df`; exact ports of `fitFDistRobustly` (replacing an approximation), `weightedLowess`/`loessFit`, `logmdigamma`, and R's `uniroot`.
+- `glmQLFit(robust=True)` is supported; new `covariate_trend`, `keep_unit_mat`, `winsor_tail_p` arguments.
+- `glmTreat`: `lfc=0` dispatches to `glmQLFTest` for QL fits; QL p-values respect the Poisson bound.
+- Unit NB deviances are floored at 0 (edgeR 4.4+).
+- `normLibSizes` alias for `calcNormFactors`.
+
 ## 0.1.3
 
 - **`estimateDisp` with infinite prior df:** when the genewise variances show no extra variability, `squeezeVar` returns `prior.df = Inf`. edgeR then skips the weighted-likelihood step (prior.n > 1e6) and leaves the tagwise dispersions at the trend (or common) value; pyedger fed the infinite weight into it and returned NaN tagwise dispersions, so `glmFit`/`glmLRT` gave NaN for every gene. Ported edgeR's handling; regression test `test_infinite_prior_df`. (0.1.0 was not affected because it fixed prior df at 10.)

@@ -31,6 +31,7 @@ from .core import (
 )
 
 calcNormFactors = calc_norm_factors
+normLibSizes = calc_norm_factors          # edgeR >= 4.0 name for calcNormFactors
 effectiveLibSizes = effective_lib_sizes
 equalizeLibSizes = equalize_lib_sizes
 estimateCommonDisp = estimate_common_disp
@@ -65,6 +66,7 @@ __all__ = [
     "aveLogCPM",
     "calc_norm_factors",
     "calcNormFactors",
+    "normLibSizes",
     "effective_lib_sizes",
     "effectiveLibSizes",
     "equalize_lib_sizes",

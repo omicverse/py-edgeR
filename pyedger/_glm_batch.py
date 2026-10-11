@@ -20,7 +20,7 @@ LOG_LOW_VALUE = np.log(LOW_VALUE)
 
 # --------------------------------------------------------------------------- deviance
 def unit_nb_deviance(y, mu, phi):
-    """nbdev.c compute_unit_nb_deviance, elementwise with broadcasting."""
+    """compute_nbdev.c compute_unit_nb_deviance (edgeR 4.10), elementwise with broadcasting."""
     y = np.asarray(y, dtype=float) + 1e-8
     mu = np.asarray(mu, dtype=float) + 1e-8
     y, mu, phi = np.broadcast_arrays(y, mu, np.asarray(phi, dtype=float))
@@ -38,7 +38,7 @@ def unit_nb_deviance(y, mu, phi):
         nb = rest & ~(prod > 1e6)
         inv = 1.0 / phi[nb]
         out[nb] = 2 * (y[nb] * np.log(y[nb] / mu[nb]) + (y[nb] + inv) * np.log((mu[nb] + inv) / (y[nb] + inv)))
-    return out
+    return np.maximum(out, 0.0)                 # edgeR >= 4.4 floors unit deviances at 0
 
 
 def nb_deviance(Y, Mu, Phi, W):
