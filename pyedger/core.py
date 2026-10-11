@@ -1359,25 +1359,29 @@ def glm_ql_fit(
     dispersion=None,
     offset=None,
     lib_size=None,
-    abundance_trend: bool = True,
-    robust: bool = False,
-    legacy: bool = True,
-    top_proportion: float = 0.05,
     weights=None,
+    abundance_trend: bool = True,
     ave_log_cpm=None,
+    covariate_trend=None,
+    robust: bool = False,
+    winsor_tail_p: tuple[float, float] = (0.05, 0.1),
+    legacy: bool = False,
+    top_proportion: float | None = None,
+    keep_unit_mat: bool = False,
 ) -> DGEGLM:
-    """edgeR 4.0 ``glmQLFit``: quasi-likelihood NB GLM fit.
+    """edgeR 4.10 ``glmQLFit``: quasi-likelihood NB GLM fit.
 
-    ``legacy=True`` (the edgeR 4.0 default) is the classic QL method with
-    zero-adjusted residual df. ``legacy=False`` uses the bias-adjusted
-    deviance and residual df of Chen, Chen & Smyth (2024), which later edgeR
-    releases make the default.
+    ``legacy=False`` (the default since edgeR 4.2) adjusts the deviance and
+    residual df for bias (Chen, Chen & Smyth 2024). The NB dispersion is
+    estimated by Cox-Reid on the ``top_proportion`` most abundant genes
+    unless given; dispersion estimates stored in a DGEList are not used
+    (edgeR >= 4.10). ``legacy=True`` is the classic method with zero-adjusted
+    residual df and the trended (else common) dispersion from the DGEList.
     """
     from . import _glm_batch as gb
-    from ._ql_adjust import compute_adjust_s2, compute_prior_s2
+    from . import _limma
+    from ._ql_adjust import compute_adj_mat, compute_adj_vec, compute_ave_qd
 
-    if robust:
-        raise NotImplementedError("Robust QL moderation is not implemented yet.")
     samples = genes = None
     if isinstance(y, DGEList):
         obj = y
@@ -1417,62 +1421,74 @@ def glm_ql_fit(
         offset = np.log(lib)
     offset = np.asarray(offset, dtype=float)
     offset_mat = np.broadcast_to(offset, counts.shape).astype(float) if offset.ndim == 1 else offset.astype(float)
-    W = np.ones_like(counts) if weights is None else np.broadcast_to(np.asarray(weights, dtype=float), counts.shape).astype(float)
     if ave_log_cpm is None:
-        ave_log_cpm = globals()["ave_log_cpm"](counts, offset=offset_mat, weights=W, dispersion=dispersion)
+        ave_log_cpm = globals()["ave_log_cpm"](counts, offset=offset_mat, weights=weights,
+                                               dispersion=0.05 if dispersion is None else dispersion)
     ave_log_cpm = np.asarray(ave_log_cpm, dtype=float)
+    W = np.ones_like(counts) if weights is None else np.broadcast_to(np.asarray(weights, dtype=float), counts.shape).astype(float)
+
     if dispersion is None:
         if legacy:
             raise ValueError("No dispersion values provided.")
-        if top_proportion < 0 or top_proportion > 1:
+        if top_proportion is None:
+            df_res = s_ - design.shape[1]
+            top_proportion = _choose_lowess_span(n * np.sqrt(df_res), small_n=20, min_span=0.02)
+        elif top_proportion < 0 or top_proportion > 1:
             raise ValueError("top.proportion should be between 0 and 1.")
-        top = ave_log_cpm >= np.quantile(ave_log_cpm, 1 - top_proportion, method="linear")
-        sub = counts[top]
-        dispersion = _disp_cox_reid(sub, design, np.log(sub.sum(axis=0)), weights=W[top])
+        ntop = int(np.ceil(top_proportion * n))
+        top = np.argsort(-ave_log_cpm, kind="stable")[:ntop]
+        if design.shape[1] >= s_:
+            dispersion = np.nan
+        else:
+            dispersion = _disp_cox_reid(counts[top], design, offset_mat[top], weights=W[top])
+    elif not legacy:
+        # The adjusted deviance algorithms assume the NB dispersion is no greater than 4.
+        d = np.asarray(dispersion, dtype=float)
+        if np.max(d) > 4:
+            dispersion = np.minimum(d, 4.0)
 
     def fit_at(disp):
-        return glm_fit(counts_df, design=design, dispersion=disp, offset=offset_mat, prior_count=0.125,
-                       weights=None if weights is None else W)
+        f = glm_fit(counts_df, design=design, dispersion=disp, offset=offset_mat, prior_count=0.125,
+                    weights=None if weights is None else W)
+        f.coef_names = coef_names
+        f.deviance = np.maximum(f.deviance, 0.0)
+        return f
 
     fit = fit_at(dispersion)
-    fit.coef_names = coef_names
-    fit.deviance = np.maximum(fit.deviance, 0.0)
-    covariate = ave_log_cpm if abundance_trend else None
+    if covariate_trend is None:
+        covariate = ave_log_cpm if abundance_trend else None
+    else:
+        covariate = np.asarray(covariate_trend, dtype=float)
     if legacy:
         zerofit = (fit.fitted_values < 1e-4) & (counts < 1e-4)
         df = gb.resid_df(zerofit, design)
         fit.df_residual_zeros = df
         s2 = np.where(df == 0, 0.0, fit.deviance / np.where(df == 0, 1.0, df))
     else:
-        disp = dispersion
-        disp_vec = np.broadcast_to(np.asarray(disp, dtype=float), (n,)).astype(float)
-        prior_disp = 1.0
-        if weights is None:
-            out = compute_adjust_s2(counts, fit.fitted_values, design, disp_vec, prior_disp, W)
-            prior_disp = compute_prior_s2(out, covariate)
-            out = compute_adjust_s2(counts, fit.fitted_values, design, disp_vec, prior_disp, W)
-            prior_disp = compute_prior_s2(out, covariate)
-            fit = fit_at(disp_vec / prior_disp)
-            fit.coef_names = coef_names
-            fit.deviance = np.maximum(fit.deviance, 0.0)
-        fit.dispersion = disp
-        out = compute_adjust_s2(counts, fit.fitted_values, design, disp_vec, prior_disp, W)
-        fit.leverage = out["leverage"]
-        fit.unit_deviance_adj = out["unit_deviance"]
-        fit.unit_df_adj = out["unit_df"]
+        disp_mat = np.asarray(dispersion, dtype=float)
+        disp_mat = np.broadcast_to(disp_mat.reshape(-1, 1) if disp_mat.ndim == 1 else disp_mat, counts.shape)
+        ave_qd = compute_ave_qd(counts, fit.fitted_values, design, disp_mat, ave_log_cpm, W)
+        fit = fit_at(np.asarray(dispersion, dtype=float) / ave_qd)
+        fit.dispersion = dispersion
+        out = compute_adj_vec(counts, fit.fitted_values, design, disp_mat, ave_qd, W)
         s2 = out["s2"]
         df = out["df"]
         fit.df_residual_adj = df
         fit.deviance_adj = out["deviance"]
-        fit.average_ql_dispersion = prior_disp
-    df = np.where(df < 0.99, 0.0, df)
-    df_prior, var_prior, var_post = _squeeze_var(s2, df, covariate=covariate)
+        fit.average_ql_dispersion = ave_qd
+        if keep_unit_mat:
+            mats = compute_adj_mat(counts, fit.fitted_values, design, disp_mat, ave_qd, W)
+            fit.leverage = mats["leverage"]
+            fit.unit_deviance_adj = mats["unit_deviance"]
+            fit.unit_df_adj = mats["unit_df"]
+        fit.top_proportion = top_proportion
+    df_prior, var_prior, var_post = _limma.squeeze_var(s2, df, covariate=covariate, robust=robust,
+                                                       winsor_tail_p=winsor_tail_p, legacy=legacy)
     fit.df_prior = df_prior
     fit.s2_prior = var_prior
     fit.s2_post = var_post
     fit.AveLogCPM = ave_log_cpm
     fit.samples, fit.genes = samples, genes
-    fit.top_proportion = top_proportion
     return fit
 
 

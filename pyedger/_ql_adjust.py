@@ -1,7 +1,8 @@
-"""NumPy port of edgeR 4.0.16's ``compute_adjust_s2`` (glmQLFit, ``legacy=FALSE``).
+"""NumPy port of edgeR 4.10's new quasi-likelihood adjustments (glmQLFit, ``legacy=FALSE``).
 
-This module reproduces, with floating-point-level parity, the C routine
-``c_compute_adjust_s2`` (src/ql_glm.c) together with everything it calls:
+This module reproduces, with floating-point-level parity, the C routines
+``compute_adj_vec`` / ``compute_adj_mat`` / ``compute_ave_qd`` (src/ql_glm.c)
+together with everything they call:
 
 * ``compute_weight``      -- src/ql_weights.c (Chebyshev approximations of the
   bias (alpha) and variance (kappa) adjustments of the NB unit deviance, plus the
@@ -10,8 +11,13 @@ This module reproduces, with floating-point-level parity, the C routine
 * ``QR_hat``              -- src/qr_hat.c (LINPACK ``dqrdc2`` with tol 1e-7 and
   limited column pivoting, then ``dqrqy`` on the first ``k`` = rank columns)
 
-and R's ``.computePriorS2`` (R/glmQLFTest.R), including an exact port of R's
-``lowess`` (``clowess``) and ``quantile(type=7)``.
+and ``compute_prior`` (the C replacement of ``.computePriorS2``), including an exact
+port of edgeR's copy of R's ``clowess``, ``rsort_with_index`` and its type-7 quantile.
+
+Changes from edgeR 4.0 reproduced here: sample weights enter the working weights,
+``compute_weight`` (via prior/w) and the unit deviance (via phi*w/prior); the
+``compute_weight`` exact branch starts at phi >= 4.001; unit deviances are floored
+at 0; df below 1e-4 is no longer zeroed (only s2 is).
 
 Everything is vectorised across genes.  Hat values are computed with a batched
 Householder reduction that follows ``dqrdc2`` step by step; genes whose weighted
@@ -29,8 +35,8 @@ Notes on faithful reproduction of C quirks
   evident intent of the code).  In practice: phi >= 4 and mu/prior > ~sqrt(2^31/phi)
   (e.g. mu > ~14,650 at phi = 10) crashes R itself.
 
-Numerical parity (vs R 4.3.3 / edgeR 4.0.16 / OpenBLAS)
--------------------------------------------------------
+Numerical parity (measured vs edgeR 4.0.16; the shared kernels are unchanged in 4.10)
+----------------------------------------------------------------------------------
 * ``deviance`` / ``unit_deviance``: bit-identical except in the phi >= 4 branch
   (R's ``dnbinom_mu`` is re-implemented via its nmath algorithm; ~1e-15 relative).
   The NB unit deviance logs go through the platform libm (``math.log``), because
@@ -49,7 +55,7 @@ import math
 import numpy as np
 from scipy.special import gammaln
 
-__all__ = ["compute_adjust_s2", "compute_prior_s2", "compute_weight", "unit_nb_deviance", "r_lowess"]
+__all__ = ["compute_adj_vec", "compute_adj_mat", "compute_ave_qd", "compute_prior", "compute_weight", "unit_nb_deviance", "r_lowess"]
 
 _LOW_BOUND = 1e-32
 _THRESHOLD_ZERO = 1e-4
@@ -937,7 +943,7 @@ def _nbdevc_1(mu, phi, kappa):
 
 
 # --------------------------------------------------------------------------------------
-# NB weights, case 2 (0.736 <= phi < 4)
+# NB weights, case 2 (0.736 <= phi < 4.001)
 # --------------------------------------------------------------------------------------
 _LOW2_A_SPEC = [  # low_bound <= mu < 50
     (0.01, lambda m: m / 0.01 - 1, 0),
@@ -1182,15 +1188,16 @@ def compute_weight(u, phi, prior=1.0):
     ``u`` and ``phi`` are broadcast together; returns ``(alpha, kappa)`` arrays
     (wpt[0] = deviance weight, wpt[1] = df weight).
     """
-    u, phi = np.broadcast_arrays(np.asarray(u, dtype=np.float64), np.asarray(phi, dtype=np.float64))
+    u, phi, prior = np.broadcast_arrays(np.asarray(u, dtype=np.float64), np.asarray(phi, dtype=np.float64),
+                                        np.asarray(prior, dtype=np.float64))
     shape = u.shape
     u = u.ravel()
     phi = phi.ravel()
     with np.errstate(all="ignore"):
-        mu = u / prior
+        mu = u / prior.ravel()
     a = np.zeros_like(mu)
     k = np.zeros_like(mu)
-    code = _select([phi < 0.736, phi < 4.0], mu.size)
+    code = _select([phi < 0.736, phi < 4.001], mu.size)       # edgeR >= 4.4 (4.0: phi < 4.0)
     s = np.nonzero(code == 0)[0]
     if s.size:
         a[s] = _nbdevc_1(mu[s], phi[s], kappa=False)
@@ -1229,7 +1236,7 @@ def unit_nb_deviance(y, mu, phi):
         invphi = 1 / pn[r]
         o[r] = 2 * (r_y * _log(r_y / r_m) + (r_y + invphi) * _log((r_m + invphi) / (r_y + invphi)))
         out[nb] = o
-    return out
+    return np.maximum(out, 0.0)                    # edgeR >= 4.4: fmax2(out, 0)
 
 
 # --------------------------------------------------------------------------------------
@@ -1403,28 +1410,7 @@ def _hat_values(xw, tol=_QR_TOL, chunk=4096):
 # --------------------------------------------------------------------------------------
 # main entry points
 # --------------------------------------------------------------------------------------
-def compute_adjust_s2(y, mu, design, dispersion, prior_dispersion=1.0, weights=None):
-    """Port of edgeR 4.0.16 ``.cxx_compute_adjust_s2`` (``c_compute_adjust_s2``).
-
-    Parameters
-    ----------
-    y, mu : array (ngenes, nsamples)
-        Counts and fitted values (NOT transposed).
-    design : array (nsamples, ncoef)
-    dispersion : scalar or array (ngenes,)
-        NB dispersion per gene (a scalar is recycled, as glmQLFit does).
-    prior_dispersion : scalar
-        Prior quasi-dispersion.  The C code reads only its first element; an
-        array is accepted and likewise only element 0 is used.
-    weights : array (ngenes, nsamples), optional
-        Sample weights (default all ones).  As in C, they multiply the adjusted
-        unit deviances in ``deviance`` but not ``unit_deviance`` or ``df``.
-
-    Returns
-    -------
-    dict with ``df``, ``deviance``, ``s2`` (ngenes,) and ``leverage``,
-    ``unit_deviance``, ``unit_df`` (ngenes, nsamples).
-    """
+def _prep(y, mu, design, dispersion, weights):
     y = np.asarray(y, dtype=np.float64)
     mu = np.asarray(mu, dtype=np.float64)
     if y.ndim == 1:
@@ -1439,50 +1425,65 @@ def compute_adjust_s2(y, mu, design, dispersion, prior_dispersion=1.0, weights=N
         X = X[:, None]
     if X.shape[0] != n:
         raise ValueError("design must have nsamples rows")
-    disp = np.asarray(dispersion, dtype=np.float64).ravel()
-    if disp.size == 1:
-        disp = np.repeat(disp, G)
-    if disp.size != G:
-        raise ValueError("dispersion has wrong length")
-    prior = float(np.asarray(prior_dispersion, dtype=np.float64).ravel()[0])
-    if weights is None:
-        w = np.ones((G, n))
-    else:
-        w = np.broadcast_to(np.asarray(weights, dtype=np.float64), (G, n))
+    disp = np.asarray(dispersion, dtype=np.float64)
+    disp = np.broadcast_to(disp.reshape(-1, 1) if disp.ndim == 1 else disp, (G, n))
+    w = np.ones((G, n)) if weights is None else np.broadcast_to(np.asarray(weights, dtype=np.float64), (G, n))
+    return y, mu, X, disp, w
 
+
+def _adjust_units(y, mu, X, disp, w, prior):
+    """Per-observation part of edgeR's ``compute_adjust_vec`` / ``compute_adjust_mat``."""
     with np.errstate(all="ignore"):
-        phi_w = (disp / prior)[:, None]
-        wt = np.sqrt(mu / (1 + mu * phi_w))  # (G, n)
-    xw = X[None, :, :] * wt[:, :, None]
-    hat, _ = _hat_values(xw)
-
-    wa, wk = compute_weight(mu, disp[:, None], prior)
+        phi_w = disp * w / prior
+        zw = np.sqrt(mu / (1 + mu * phi_w))
+    hat, _ = _hat_values(X[None, :, :] * zw[:, :, None])
+    with np.errstate(all="ignore"):
+        wa, wk = compute_weight(mu, disp, prior / w)
     udp = unit_nb_deviance(y, mu, phi_w)
     hdp = 1.0 - hat
-    small = hdp < _THRESHOLD_ZERO
+    small = hdp < _THRESHOLD_ZERO                # correction for extremely small leverage
     udp = np.where(small, 0.0, udp)
     hdp = np.where(small, 0.0, hdp)
-    unit_dev = udp * wa
-    unit_df = hdp * wk
+    return udp * wa, hdp * wk, hat
 
+
+def compute_adj_vec(y, mu, design, dispersion, prior=1.0, weights=None):
+    """edgeR 4.10 ``.cxx_compute_adj_vec`` (src/ql_glm.c ``compute_adjust_vec``).
+
+    ``dispersion`` is per gene (G,) or a (G, n) matrix; ``weights`` defaults to 1.
+    Returns ``df``, ``deviance`` and ``s2`` per gene. Unlike edgeR 4.0, df is
+    not zeroed when it is below 1e-4 (only s2 is).
+    """
+    y, mu, X, disp, w = _prep(y, mu, design, dispersion, weights)
+    prior = float(np.asarray(prior, dtype=np.float64).ravel()[0])
+    unit_dev, unit_df, _ = _adjust_units(y, mu, X, disp, w, prior)
+    G, n = y.shape
     dev = np.zeros(G)
     df = np.zeros(G)
-    for j in range(n):  # sequential accumulation as in C
+    for j in range(n):                           # sequential accumulation as in C
         dev = dev + unit_dev[:, j] * w[:, j]
         df = df + unit_df[:, j]
     zero = df < _THRESHOLD_ZERO
     with np.errstate(all="ignore"):
         s2 = np.where(zero, 0.0, dev / np.where(zero, 1.0, df))
-    df = np.where(zero, 0.0, df)
-    return {
-        "df": df,
-        "deviance": dev,
-        "s2": s2,
-        "leverage": hat,
-        "unit_deviance": unit_dev,
-        "unit_df": unit_df,
-    }
+    return {"df": df, "deviance": dev, "s2": s2}
 
+
+def compute_adj_mat(y, mu, design, dispersion, prior=1.0, weights=None):
+    """edgeR 4.10 ``.cxx_compute_adj_mat``: unit df, unit deviance and leverage matrices."""
+    y, mu, X, disp, w = _prep(y, mu, design, dispersion, weights)
+    prior = float(np.asarray(prior, dtype=np.float64).ravel()[0])
+    unit_dev, unit_df, hat = _adjust_units(y, mu, X, disp, w, prior)
+    return {"unit_df": unit_df, "unit_deviance": unit_dev, "leverage": hat}
+
+
+def compute_ave_qd(y, mu, design, dispersion, ave_log_cpm, weights=None):
+    """edgeR 4.10 ``.cxx_compute_ave_qd`` (``update_prior``): two updates from prior = 1."""
+    prior = 1.0
+    for _ in range(2):
+        out = compute_adj_vec(y, mu, design, dispersion, prior, weights)
+        prior = compute_prior(ave_log_cpm, out["s2"], out["df"])
+    return prior
 
 # --------------------------------------------------------------------------------------
 # .computePriorS2 with exact R lowess / quantile
@@ -1522,7 +1523,7 @@ def _lowest(x, y, n, xs, nleft, nright, w, userw, rw):
         a = _seqsum(ww * xx)
         b = xs - a
         d = xx - a
-        c = _seqsum(ww * d * d)
+        c = _seqsum(ww * (d * d))                  # w[j]*fsquare(x[j]-a)
         if np.sqrt(c) > 0.001 * rng:
             b /= c
             ww = ww * (b * d + 1.0)
@@ -1624,14 +1625,54 @@ def _r_quantile7(x, prob):
     return qs
 
 
-def compute_prior_s2(out, ave_log_cpm=None):
-    """Port of edgeR's ``.computePriorS2(out, AveLogCPM)``."""
-    s2_all = np.asarray(out["s2"], dtype=np.float64)
-    if ave_log_cpm is None:
-        return max(float(np.median(s2_all)), 1.0)
-    df = np.asarray(out["df"], dtype=np.float64)
-    s2 = np.sqrt(np.sqrt(s2_all))
-    o = df > 1e-8
-    A = np.asarray(ave_log_cpm, dtype=np.float64)
-    _, m = r_lowess(A[o], s2[o], f=0.5)
-    return max(_r_quantile7(m, 0.9), 1.0) ** 4
+def _rsort_with_index(x):
+    """Order produced by R's ``rsort_with_index`` (Shell sort; not stable for ties)."""
+    x = np.asarray(x, dtype=np.float64)
+    o = np.argsort(x, kind="stable")
+    xs = x[o]
+    if xs.size < 2 or not np.any(xs[1:] == xs[:-1]):
+        return o                                 # no ties: every sort gives the same order
+    xl = x.tolist()
+    idx = list(range(len(xl)))
+    n = len(xl)
+    h = 1
+    while h <= n // 9:
+        h = 3 * h + 1
+    while h > 0:
+        for i in range(h, n):
+            v, iv = xl[i], idx[i]
+            j = i
+            while j >= h and xl[j - h] > v:
+                xl[j] = xl[j - h]
+                idx[j] = idx[j - h]
+                j -= h
+            xl[j] = v
+            idx[j] = iv
+        h //= 3
+    return np.asarray(idx)
+
+
+def compute_prior(ave_log_cpm, s2, df):
+    """edgeR 4.10 ``compute_prior`` (src/ql_glm.c): average quasi-dispersion.
+
+    Lowess (f = 0.5, iter = 3) of s2^(1/4) on AveLogCPM over genes with
+    df > 1e-8, 90% quantile (type 7) of the fitted trend, floored at 1, ^4.
+    """
+    ag = np.asarray(ave_log_cpm, dtype=np.float64)
+    s2 = np.asarray(s2, dtype=np.float64)
+    df = np.asarray(df, dtype=np.float64)
+    keep = df > 1e-8
+    xx = ag[keep]
+    yy = np.sqrt(np.sqrt(s2[keep]))
+    k = xx.size
+    o = _rsort_with_index(xx)
+    xs, ys = xx[o], yy[o]
+    delta = 0.01 * (xs[k - 1] - xs[0])
+    ans = np.sort(_clowess(xs, ys, 0.5, 3, delta))
+    m = (k - 1) * 0.9
+    lo = int(m)
+    h = m - lo
+    p = (1 - h) * ans[lo] + h * ans[min(lo + 1, k - 1)]
+    if p < 1.0:
+        p = 1.0
+    return p * p * p * p

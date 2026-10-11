@@ -67,7 +67,7 @@ def test_design_estimate_disp(setup, legacy_span):
         _close(y.AveLogCPM, r["ave"])
 
 
-def _check_ql(fit, res, name, rtol=RTOL, atol=1e-7):
+def _check_ql(fit, res, name, rtol=RTOL, atol=1e-7, scalars=True):
     r = _read(f"{name}.tsv")
     _close(res["logFC"], r["logFC"], rtol=rtol, atol=atol)
     _close(res["logCPM"], r["logCPM"])
@@ -77,7 +77,7 @@ def _check_ql(fit, res, name, rtol=RTOL, atol=1e-7):
     _close(np.broadcast_to(fit.s2_prior, len(r)), r["s2prior"], rtol=rtol)
     _close(np.broadcast_to(fit.df_prior, len(r)), r["dfprior"], rtol=rtol)
     sc = DATA / f"{name}_scalar.tsv"
-    if sc.exists():
+    if scalars and sc.exists():
         s = _read(sc.name)
         _close(fit.top_proportion, s["top_proportion"][0], rtol=1e-12)
         _close(np.ravel(fit.dispersion)[0], s["dispersion"][0], rtol=rtol)
@@ -89,7 +89,32 @@ def test_design_ql(setup, legacy):
     X, cond, D = setup
     y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
     fit = pyedger.glmQLFit(y, D, legacy=legacy)
-    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, f"design_ql_legacy{int(legacy)}")
+    # legacy=False estimates the NB dispersion by Cox-Reid on the top genes (R's
+    # optimize(tol=1e-5)), so it agrees with R only to the Cox-Reid level; see
+    # test_design_ql_given_dispersion for the exact check of the rest.
+    rtol, atol = (RTOL, 1e-7) if legacy else (RTOL_COXREID, 1e-5)
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, f"design_ql_legacy{int(legacy)}", rtol, atol)
+
+
+def test_design_ql_given_dispersion(setup):
+    # New QL method with R's Cox-Reid dispersion supplied: everything downstream
+    # (average QL dispersion, adjusted deviance/df, squeezeVar, F-test) is exact.
+    X, cond, D = setup
+    y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
+    disp = _read("design_ql_legacy0_scalar.tsv")["dispersion"][0]
+    fit = pyedger.glmQLFit(y, D, dispersion=disp)
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_legacy0", RTOL, 1e-9, scalars=False)
+    assert fit.top_proportion is None             # edgeR leaves top.proportion NULL when dispersion is given
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_design_ql_robust(setup, legacy):
+    X, cond, D = setup
+    y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
+    disp = None if legacy else _read("design_ql_legacy0_scalar.tsv")["dispersion"][0]
+    fit = pyedger.glmQLFit(y, D, legacy=legacy, robust=True, dispersion=disp)
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, f"design_ql_robust_legacy{int(legacy)}",
+              RTOL, 1e-9, scalars=False)
 
 
 def test_design_ql_without_dispersion(setup):
@@ -97,7 +122,7 @@ def test_design_ql_without_dispersion(setup):
     # DGEList carries dispersion estimates.
     X, cond, D = setup
     fit = pyedger.glmQLFit(_dge(X, cond), D)
-    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_nodisp")
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_nodisp", RTOL_COXREID, 1e-5)
 
 
 def test_design_ql_options(setup):
