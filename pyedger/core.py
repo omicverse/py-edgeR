@@ -81,7 +81,8 @@ class DGEList:
         self.samples["lib.size"] = lib
         self.samples["norm.factors"] = nf
         if group is not None:
-            self.samples["group"] = list(group)
+            # keep categorical level order (R factor semantics); plain values stay as given
+            self.samples["group"] = pd.Categorical(group) if isinstance(group, pd.Categorical) else list(group)
         self.genes = genes
         self.weights = None if weights is None else _as_weight_matrix(weights, counts_df.shape, counts_df.index, counts_df.columns)
         self.common_dispersion = None
@@ -127,6 +128,9 @@ class DGEGLM:
     average_ql_dispersion: float | None = None
     top_proportion: float | None = None
     weights: np.ndarray | None = None
+    leverage: np.ndarray | None = None
+    unit_deviance_adj: np.ndarray | None = None
+    unit_df_adj: np.ndarray | None = None
 
 
 @dataclass
@@ -407,18 +411,46 @@ def equalize_lib_sizes(object, group=None, dispersion=None, lib_size=None):
     return pseudo, common_lib
 
 
-def ave_log_cpm(x, normalized_lib_sizes: bool = True, prior_count: float = 2.0, dispersion=None) -> np.ndarray:
-    """Approximate edgeR ``aveLogCPM`` for abundance trend displays/tests."""
+def ave_log_cpm(x, normalized_lib_sizes: bool = True, prior_count: float = 2.0, dispersion=None,
+                lib_size=None, offset=None, weights=None) -> np.ndarray:
+    """edgeR ``aveLogCPM``: one-group NB fit on prior-augmented counts (R_ave_log_cpm.cpp).
 
+    For a DGEList, ``dispersion=None`` uses the common dispersion when present
+    (as ``aveLogCPM.DGEList`` does); otherwise 0.05.
+    """
+    from . import _glm_batch as gb
     if isinstance(x, DGEList):
         counts = x.counts.to_numpy(dtype=float)
-        lib = effective_lib_sizes(x) if normalized_lib_sizes else x.samples["lib.size"].to_numpy(dtype=float)
+        if lib_size is None and offset is None:
+            lib_size = effective_lib_sizes(x) if normalized_lib_sizes else x.samples["lib.size"].to_numpy(dtype=float)
+        if dispersion is None:
+            dispersion = x.common_dispersion
+        if weights is None and x.weights is not None:
+            weights = x.weights.to_numpy(dtype=float)
     else:
         counts = x.to_numpy(dtype=float) if isinstance(x, pd.DataFrame) else np.asarray(x, dtype=float)
-        lib = counts.sum(axis=0)
-    mean_lib = np.mean(lib)
-    prior = prior_count * lib / mean_lib
-    return np.log2(np.mean((counts + prior[None, :]) / (lib[None, :] + 2 * prior[None, :]) * 1e6, axis=1))
+    n, s = counts.shape
+    if n == 0:
+        return np.zeros(0)
+    if offset is None:
+        lib = np.asarray(lib_size if lib_size is not None else counts.sum(axis=0), dtype=float)
+        if np.all(counts == 0) and np.max(lib) == 0:
+            return np.full(n, (-np.log(n) + np.log(1e6)) / np.log(2))
+        off = np.broadcast_to(np.log(lib), counts.shape)
+    else:
+        off = np.asarray(offset, dtype=float)
+        off = np.broadcast_to(off, counts.shape) if off.ndim <= 1 else off
+    disp = np.asarray(0.05 if dispersion is None else dispersion, dtype=float)
+    if np.all(np.isnan(disp)):
+        disp = np.asarray(0.05)
+    elif np.any(np.isnan(disp)):
+        disp = np.where(np.isnan(disp), np.nanmean(disp), disp)
+    phi = np.broadcast_to(disp[:, None] if disp.ndim == 1 else disp, counts.shape)
+    W = np.ones_like(counts) if weights is None else np.broadcast_to(np.asarray(weights, dtype=float), counts.shape)
+    libs = np.exp(off)
+    prior = float(prior_count) * libs / libs.mean(axis=1, keepdims=True)
+    beta = gb.mglm_one_group(counts + prior, np.log(libs + 2 * prior), phi, W, maxit=50, tol=1e-10)
+    return (beta + np.log(1e6)) / np.log(2)
 
 
 def estimate_common_disp(object, group=None, rowsum_filter: float = 5.0):
@@ -455,13 +487,7 @@ def estimate_common_disp(object, group=None, rowsum_filter: float = 5.0):
             def objective(delta):
                 return -_common_cond_loglik_delta(split, delta)
 
-            opt = optimize.minimize_scalar(
-                objective,
-                bounds=(1e-4, 100.0 / 101.0),
-                method="bounded",
-                options={"xatol": 1e-6},
-            )
-            delta = float(opt.x)
+            delta = _brent_fmin(objective, 1e-4, 100.0 / 101.0, 1e-6)
             disp = delta / (1.0 - delta)
     if isinstance(object, DGEList):
         object.common_dispersion = disp
@@ -513,7 +539,7 @@ def estimate_disp(
     object,
     group=None,
     tagwise: bool = True,
-    prior_df: float | None = 10.0,
+    prior_df: float | None = None,
     trend_method: str = "locfit",
     min_row_sum: float = 5.0,
     grid_length: int = 21,
@@ -543,7 +569,14 @@ def estimate_disp(
     lib = effective_lib_sizes(object)
     y = object.counts.to_numpy(dtype=float)
     if design is None:
-        estimate_common_disp(object, group=groups, rowsum_filter=min_row_sum)
+        if np.all(pd.Series(groups).value_counts().to_numpy() <= 1):
+            object.common_dispersion = object.trended_dispersion = object.tagwise_dispersion = np.nan
+            return object
+        sel0 = y.sum(axis=1) >= min_row_sum
+        pseudo0, _ = equalize_lib_sizes(y, group=groups, dispersion=0.01, lib_size=lib)
+        split0 = _split_into_groups(pseudo0[sel0], groups)
+        delta0 = _brent_fmin(lambda d: -_common_cond_loglik_delta(split0, d), 1e-4, 100.0 / 101.0, 1e-6)
+        object.common_dispersion = delta0 / (1.0 - delta0)
         design_matrix = None
     elif isinstance(design, pd.DataFrame):
         design_matrix = design.to_numpy(dtype=float)
@@ -589,12 +622,16 @@ def estimate_disp(
         ncoefs = design_matrix.shape[1]
     common_theta = _maximize_interpolant(theta, np.sum(l0, axis=0)[None, :])[0]
     object.common_dispersion = float(0.1 * 2.0**common_theta)
+    # edgeR recomputes AveLogCPM at the common dispersion before fitting the trend.
+    ave = ave_log_cpm(object.counts, lib_size=lib, dispersion=object.common_dispersion,
+                      weights=None if object.weights is None else object.weights.to_numpy(dtype=float))
     if not tagwise or not np.isfinite(object.common_dispersion):
         object.trended_dispersion = None if trend_method == "none" else np.full(y.shape[0], object.common_dispersion)
         return object
     if trend_method in {"movingave", "loess", "locfit", "locfit.mixed"}:
         if span is None:
-            span = _choose_lowess_span(int(np.sum(sel)), small_n=50, min_span=0.3, power=1.0 / 3.0)
+            nsel = int(np.sum(sel))   # WLEB default span
+            span = 1.0 if nsel <= 50 else 0.25 + 0.75 * (50.0 / nsel) ** 0.5
         if trend_method == "movingave":
             m0 = _moving_average_loglik(l0, ave[sel], span=float(span))
         elif trend_method == "locfit":
@@ -665,19 +702,119 @@ def estimate_disp(
     object.prior_df = float(prior_df) if np.asarray(prior_df).ndim == 0 else np.asarray(prior_df, dtype=float)
     object.prior_n = float(prior_n) if np.asarray(prior_n).ndim == 0 else np.asarray(prior_n, dtype=float)
     object.span = span
-    object.AveLogCPM = ave_log_cpm(object, dispersion=tagwise_disp)
+    object.AveLogCPM = ave_log_cpm(object)      # aveLogCPM.DGEList: common dispersion
     return object
 
 
 def estimate_glm_common_disp(object, design=None, method: str = "CoxReid", subset: int = 10000, **kwargs):
-    """Compatibility wrapper for edgeR's legacy GLM common-dispersion API."""
+    """edgeR ``estimateGLMCommonDisp`` (CoxReid): maximise the summed Cox-Reid APL."""
 
     if method.lower() != "coxreid":
         raise NotImplementedError("Only method='CoxReid' is implemented for estimate_glm_common_disp.")
     if not isinstance(object, DGEList):
         object = DGEList(object)
-    estimate_disp(object, design=design, tagwise=False, trend_method="none", **kwargs)
+    counts = object.counts.to_numpy(dtype=float)
+    X = _default_design_from_group(object).to_numpy(dtype=float) if design is None and "group" in object.samples else (
+        np.ones((counts.shape[1], 1)) if design is None else np.asarray(design, dtype=float))
+    if X.shape[1] >= counts.shape[1]:
+        object.common_dispersion = np.nan
+        return object
+    off = np.broadcast_to(np.log(effective_lib_sizes(object)), counts.shape)
+    W = None if object.weights is None else object.weights.to_numpy(dtype=float)
+    object.common_dispersion = _disp_cox_reid(counts, X, off, weights=W, ave_log_cpm=ave_log_cpm(object), subset=subset, **kwargs)
     return object
+
+
+def _brent_fmin(f, ax, bx, tol):
+    """R stats optimize.c Brent_fmin (minimiser)."""
+    c = (3.0 - np.sqrt(5.0)) * 0.5
+    eps = np.sqrt(np.finfo(float).eps)
+    a, b = ax, bx
+    v = w = x = a + c * (b - a)
+    d = e = 0.0
+    fx = f(x); fv = fw = fx
+    tol3 = tol / 3.0
+    while True:
+        xm = (a + b) * 0.5
+        tol1 = eps * abs(x) + tol3
+        t2 = tol1 * 2.0
+        if abs(x - xm) <= t2 - (b - a) * 0.5:
+            break
+        p = q = r = 0.0
+        if abs(e) > tol1:
+            r = (x - w) * (fx - fv)
+            q = (x - v) * (fx - fw)
+            p = (x - v) * q - (x - w) * r
+            q = (q - r) * 2.0
+            if q > 0.0:
+                p = -p
+            else:
+                q = -q
+            r = e
+            e = d
+        if abs(p) >= abs(q * 0.5 * r) or p <= q * (a - x) or p >= q * (b - x):
+            e = (b - x) if x < xm else (a - x)
+            d = c * e
+        else:
+            d = p / q
+            u = x + d
+            if u - a < t2 or b - u < t2:
+                d = tol1 if x < xm else -tol1
+        if abs(d) >= tol1:
+            u = x + d
+        elif d > 0.0:
+            u = x + tol1
+        else:
+            u = x - tol1
+        fu = f(u)
+        if fu <= fx:
+            if u < x:
+                b = x
+            else:
+                a = x
+            v, w, x = w, x, u
+            fv, fw, fx = fw, fx, fu
+        else:
+            if u < x:
+                a = u
+            else:
+                b = u
+            if fu <= fw or w == x:
+                v, fv, w, fw = w, fw, u, fu
+            elif fu <= fv or v == x or v == w:
+                v, fv = u, fu
+    return x
+
+
+def _disp_cox_reid(y, design, offset, weights=None, ave_log_cpm=None, interval=(0.0, 4.0), tol=1e-5,
+                   min_row_sum=5, subset=10000):
+    """edgeR dispCoxReid."""
+    from . import _glm_batch as gb
+    y = np.asarray(y, dtype=float)
+    offset = np.broadcast_to(np.asarray(offset, dtype=float), y.shape)
+    W = np.ones_like(y) if weights is None else np.broadcast_to(np.asarray(weights, dtype=float), y.shape)
+    keep = y.sum(axis=1) >= min_row_sum
+    y, offset, W = y[keep], offset[keep], W[keep]
+    if ave_log_cpm is not None:
+        ave_log_cpm = np.asarray(ave_log_cpm, dtype=float)[keep]
+    if y.shape[0] < 1:
+        raise ValueError("no data rows with required number of counts")
+    if subset is not None and subset <= y.shape[0] / 2:
+        if ave_log_cpm is None:
+            ave_log_cpm = globals()["ave_log_cpm"](y, offset=offset, weights=W)
+        ratio = int(np.floor(y.shape[0] / subset))
+        if ratio > 1:
+            o = np.argsort(ave_log_cpm, kind="stable")
+            i = o[np.arange(int(np.floor(ratio / 2)), y.shape[0], ratio)]
+            y, offset, W = y[i], offset[i], W[i]
+    X = np.asarray(design, dtype=float)
+
+    def negapl(par):
+        phi = np.full_like(y, par ** 4)
+        _, mu, _ = _fit_glm_batch(y, X, offset, phi, W)
+        return -np.sum(gb.compute_apl(y, mu, phi, W, X))
+
+    return _brent_fmin(negapl, interval[0] ** 0.25, interval[1] ** 0.25, tol) ** 4
 
 
 def estimate_glm_trended_disp(object, design=None, method: str = "auto", span: float | None = None, **kwargs):
@@ -730,6 +867,7 @@ def glm_fit(
     lib_size=None,
     prior_count: float = 0.125,
     weights=None,
+    start=None,
 ) -> DGEGLM:
     """Fit row-wise negative-binomial GLMs, mirroring ``edgeR::glmFit``.
 
@@ -755,6 +893,7 @@ def glm_fit(
             offset=offset,
             prior_count=prior_count,
             weights=weights,
+            start=start,
         )
         fit.samples = obj.samples
         fit.genes = obj.genes
@@ -804,26 +943,16 @@ def glm_fit(
     weight_df = None if weights is None else _as_weight_matrix(weights, counts.shape, counts_df.index, counts_df.columns)
     weight_mat = None if weight_df is None else weight_df.to_numpy(dtype=float)
 
-    beta = np.zeros((n_tags, X.shape[1]), dtype=float)
-    fitted = np.zeros_like(counts, dtype=float)
-    dev = np.zeros(n_tags, dtype=float)
-    for i in range(n_tags):
-        wi = None if weight_mat is None else weight_mat[i]
-        b, mu = _fit_nb_glm_row(counts[i], X, offset_mat[i], disp_vec[i], weights=wi)
-        beta[i] = b
-        fitted[i] = mu
-        dev[i] = _nbinom_deviance_row(counts[i], mu, disp_vec[i], weights=wi)
+    W = np.ones_like(counts) if weight_mat is None else weight_mat
+    phi_mat = np.broadcast_to(disp_vec[:, None], counts.shape)
+    beta, fitted, dev = _fit_glm_batch(counts, X, offset_mat, phi_mat, W, start=start)
 
     unshrunk_beta = None
     if prior_count > 0:
+        # edgeR predFC: refit on prior-augmented counts with the same algorithm.
         unshrunk_beta = beta.copy()
         aug_counts, aug_offset = _add_prior_count(counts, offset_mat, prior_count)
-        shrunk_beta = np.zeros_like(beta)
-        for i in range(n_tags):
-            wi = None if weight_mat is None else weight_mat[i]
-            b, _ = _fit_nb_glm_row(aug_counts[i], X, aug_offset[i], disp_vec[i], weights=wi)
-            shrunk_beta[i] = b
-        beta = shrunk_beta
+        beta, _, _ = _fit_glm_batch(aug_counts, X, aug_offset, phi_mat, W)
 
     return DGEGLM(
         coefficients=beta,
@@ -840,6 +969,19 @@ def glm_fit(
         unshrunk_coefficients=unshrunk_beta,
         weights=weight_mat,
     )
+
+
+def _fit_glm_batch(counts, X, offset_mat, phi_mat, W, start=None):
+    """edgeR glmFit.default core: one-way shortcut or Levenberg, all genes at once."""
+    from . import _glm_batch as gb
+    if gb.is_one_way(X):
+        beta, mu = gb.mglm_one_way(counts, X, offset_mat, phi_mat, W, start=start)
+        dev = gb.nb_deviance(counts, mu, phi_mat, W)
+    else:
+        if start is None:
+            start = gb.levenberg_start(counts, offset_mat, phi_mat, W, X)
+        beta, mu, dev, _, _ = gb.fit_levenberg(counts, offset_mat, phi_mat, W, X, start, tol=1e-6, maxit=250)
+    return beta, mu, dev
 
 
 def pred_fc(y, design, prior_count: float = 0.125, offset=None, dispersion=None, weights=None) -> pd.DataFrame:
@@ -914,10 +1056,13 @@ def glm_lrt(glmfit: DGEGLM, coef=None, contrast=None) -> DGELRT:
         design0 = np.delete(design, coef_i, axis=1)
         comparison = glmfit.coef_names[coef_i]
 
+    null_disp = glmfit.dispersion
+    if glmfit.average_ql_dispersion is not None:      # new QL method fits the null at the working dispersion
+        null_disp = np.asarray(glmfit.dispersion, dtype=float) / glmfit.average_ql_dispersion
     null = glm_fit(
         glmfit.counts,
         design=design0,
-        dispersion=glmfit.dispersion,
+        dispersion=null_disp,
         offset=glmfit.offset,
         prior_count=0,
         weights=glmfit.weights,
@@ -1186,85 +1331,120 @@ def glm_ql_fit(
     dispersion=None,
     offset=None,
     lib_size=None,
-    abundance_trend: bool = False,
+    abundance_trend: bool = True,
     robust: bool = False,
     legacy: bool = True,
-    top_proportion: float | None = None,
+    top_proportion: float = 0.05,
+    weights=None,
+    ave_log_cpm=None,
 ) -> DGEGLM:
-    """Fit quasi-likelihood NB GLMs.
+    """edgeR 4.0 ``glmQLFit``: quasi-likelihood NB GLM fit.
 
-    The legacy path has close R parity. The new-style path implements a
-    Python-native approximation of edgeR's bias-adjusted QL workflow for dense
-    designs.
+    ``legacy=True`` (the edgeR 4.0 default) is the classic QL method with
+    zero-adjusted residual df. ``legacy=False`` uses the bias-adjusted
+    deviance and residual df of Chen, Chen & Smyth (2024), which later edgeR
+    releases make the default.
     """
+    from . import _glm_batch as gb
+    from ._ql_adjust import compute_adjust_s2, compute_prior_s2
 
     if robust:
         raise NotImplementedError("Robust QL moderation is not implemented yet.")
-
-    if not legacy and dispersion is None and isinstance(y, DGEList):
+    samples = genes = None
+    if isinstance(y, DGEList):
+        obj = y
         if design is None:
-            design = _default_design_from_group(y)
-        estimate_disp(y, design=design, trend_method="none", tagwise=False)
-        dispersion = y.common_dispersion
-
-    fit = glm_fit(
-        y,
-        design=design,
-        dispersion=dispersion,
-        offset=offset,
-        lib_size=lib_size,
-        prior_count=0.125,
-    )
-    df = fit.df_residual.copy()
-    if legacy:
-        s2 = np.zeros_like(fit.deviance, dtype=float)
-        ok = df > 0
-        s2[ok] = fit.deviance[ok] / df[ok]
-        fit.df_residual_zeros = df
+            design = getattr(obj, "design", None)
+            if design is None and "group" in obj.samples and pd.Series(obj.samples["group"]).nunique() > 1:
+                design = _default_design_from_group(obj)
+        if obj.AveLogCPM is None:
+            obj.AveLogCPM = globals()["ave_log_cpm"](obj)
+        if ave_log_cpm is None:
+            ave_log_cpm = obj.AveLogCPM
+        if legacy and dispersion is None:
+            dispersion = obj.trended_dispersion if obj.trended_dispersion is not None else obj.common_dispersion
+            if dispersion is None:
+                raise ValueError("No dispersion values found in DGEList object.")
+        if offset is None:
+            offset = np.log(effective_lib_sizes(obj))
+        if weights is None and obj.weights is not None:
+            weights = obj.weights.to_numpy(dtype=float)
+        samples, genes = obj.samples, obj.genes
+        counts_df = obj.counts
     else:
-        if top_proportion is None:
-            top_proportion = _choose_lowess_span(
-                int(fit.counts.shape[0] * np.sqrt(max(float(np.nanmax(df)), 1.0))),
-                small_n=20,
-                min_span=0.02,
-                power=1.0 / 3.0,
-            )
-        raw_s2 = np.zeros_like(fit.deviance, dtype=float)
-        ok = df > 0
-        raw_s2[ok] = fit.deviance[ok] / df[ok]
-        ave_ql = _average_ql_dispersion(raw_s2, df, fit.AveLogCPM if fit.AveLogCPM is not None else ave_log_cpm(fit.counts))
-        disp_base = np.asarray(fit.dispersion, dtype=float)
-        if disp_base.ndim == 0:
-            disp_base = float(disp_base)
-        old_coef_names = fit.coef_names
-        old_samples = fit.samples
-        old_genes = fit.genes
-        old_ave = fit.AveLogCPM
-        fit = glm_fit(
-            fit.counts,
-            design=fit.design,
-            dispersion=disp_base / ave_ql,
-            offset=fit.offset,
-            prior_count=0.125,
-        )
-        fit.coef_names = old_coef_names
-        fit.samples = old_samples
-        fit.genes = old_genes
-        fit.AveLogCPM = old_ave
-        fit.dispersion = disp_base
-        fit.average_ql_dispersion = ave_ql
-        fit.top_proportion = top_proportion
-        fit.df_residual_adj = fit.df_residual.copy()
-        fit.deviance_adj = fit.deviance.copy()
-        s2 = np.zeros_like(fit.deviance, dtype=float)
-        ok = fit.df_residual_adj > 0
-        s2[ok] = fit.deviance_adj[ok] / fit.df_residual_adj[ok]
-        df = fit.df_residual_adj
-    covariate = fit.AveLogCPM if abundance_trend else None
+        counts_df = y.copy() if isinstance(y, pd.DataFrame) else pd.DataFrame(np.asarray(y, dtype=float))
+    counts = counts_df.to_numpy(dtype=float)
+    n, s_ = counts.shape
+    if design is None:
+        design = np.ones((s_, 1))
+        coef_names = ["Intercept"]
+    elif isinstance(design, pd.DataFrame):
+        coef_names = list(design.columns.astype(str))
+        design = design.to_numpy(dtype=float)
+    else:
+        design = np.asarray(design, dtype=float)
+        coef_names = [f"coef_{i}" for i in range(design.shape[1])]
+    if offset is None:
+        lib = np.asarray(lib_size if lib_size is not None else counts.sum(axis=0), dtype=float)
+        offset = np.log(lib)
+    offset = np.asarray(offset, dtype=float)
+    offset_mat = np.broadcast_to(offset, counts.shape).astype(float) if offset.ndim == 1 else offset.astype(float)
+    W = np.ones_like(counts) if weights is None else np.broadcast_to(np.asarray(weights, dtype=float), counts.shape).astype(float)
+    if ave_log_cpm is None:
+        ave_log_cpm = globals()["ave_log_cpm"](counts, offset=offset_mat, weights=W, dispersion=dispersion)
+    ave_log_cpm = np.asarray(ave_log_cpm, dtype=float)
+    if dispersion is None:
+        if legacy:
+            raise ValueError("No dispersion values provided.")
+        if top_proportion < 0 or top_proportion > 1:
+            raise ValueError("top.proportion should be between 0 and 1.")
+        top = ave_log_cpm >= np.quantile(ave_log_cpm, 1 - top_proportion, method="linear")
+        sub = counts[top]
+        dispersion = _disp_cox_reid(sub, design, np.log(sub.sum(axis=0)), weights=W[top])
+
+    def fit_at(disp):
+        return glm_fit(counts_df, design=design, dispersion=disp, offset=offset_mat, prior_count=0.125,
+                       weights=None if weights is None else W)
+
+    fit = fit_at(dispersion)
+    fit.coef_names = coef_names
+    fit.deviance = np.maximum(fit.deviance, 0.0)
+    covariate = ave_log_cpm if abundance_trend else None
+    if legacy:
+        zerofit = (fit.fitted_values < 1e-4) & (counts < 1e-4)
+        df = gb.resid_df(zerofit, design)
+        fit.df_residual_zeros = df
+        s2 = np.where(df == 0, 0.0, fit.deviance / np.where(df == 0, 1.0, df))
+    else:
+        disp = dispersion
+        disp_vec = np.broadcast_to(np.asarray(disp, dtype=float), (n,)).astype(float)
+        prior_disp = 1.0
+        if weights is None:
+            out = compute_adjust_s2(counts, fit.fitted_values, design, disp_vec, prior_disp, W)
+            prior_disp = compute_prior_s2(out, covariate)
+            out = compute_adjust_s2(counts, fit.fitted_values, design, disp_vec, prior_disp, W)
+            prior_disp = compute_prior_s2(out, covariate)
+            fit = fit_at(disp_vec / prior_disp)
+            fit.coef_names = coef_names
+            fit.deviance = np.maximum(fit.deviance, 0.0)
+        fit.dispersion = disp
+        out = compute_adjust_s2(counts, fit.fitted_values, design, disp_vec, prior_disp, W)
+        fit.leverage = out["leverage"]
+        fit.unit_deviance_adj = out["unit_deviance"]
+        fit.unit_df_adj = out["unit_df"]
+        s2 = out["s2"]
+        df = out["df"]
+        fit.df_residual_adj = df
+        fit.deviance_adj = out["deviance"]
+        fit.average_ql_dispersion = prior_disp
+    df = np.where(df < 0.99, 0.0, df)
     df_prior, var_prior, var_post = _squeeze_var(s2, df, covariate=covariate)
     fit.df_prior = df_prior
     fit.s2_prior = var_prior
     fit.s2_post = var_post
+    fit.AveLogCPM = ave_log_cpm
+    fit.samples, fit.genes = samples, genes
+    fit.top_proportion = top_proportion
     return fit
 
 
@@ -1283,6 +1463,20 @@ def glm_qlf_test(glmfit: DGEGLM, coef=None, contrast=None, poisson_bound: bool =
     df_total = np.asarray(glmfit.df_prior, dtype=float) + df_resid
     df_total = np.minimum(df_total, np.sum(glmfit.df_residual))
     pvals = stats.f.sf(f_stat, out.df_test, df_total)
+    if poisson_bound:
+        # edgeR .isBelowPoissonBound: never more significant than the Poisson-variance LRT.
+        disp = np.broadcast_to(np.asarray(glmfit.dispersion, dtype=float).reshape(-1, 1) if np.ndim(glmfit.dispersion) else glmfit.dispersion,
+                               glmfit.fitted_values.shape)
+        s2 = np.asarray(glmfit.s2_post, dtype=float).reshape(-1, 1)
+        below = np.any((glmfit.fitted_values * disp + 1) * s2 < 1, axis=1)
+        if np.any(below):
+            i = np.flatnonzero(below)
+            pois = glm_fit(glmfit.counts.iloc[i], design=glmfit.design, dispersion=0.0, offset=np.asarray(glmfit.offset)[i],
+                           prior_count=0.125, weights=None if glmfit.weights is None else np.asarray(glmfit.weights)[i],
+                           start=None if glmfit.unshrunk_coefficients is None else glmfit.unshrunk_coefficients[i])
+            pois.coef_names = glmfit.coef_names
+            pres = glm_lrt(pois, coef=coef, contrast=contrast)
+            pvals[i] = np.maximum(pvals[i], pres.table["PValue"].to_numpy(dtype=float))
     out.table = out.table.drop(columns=["LR", "PValue"])
     out.table["F"] = f_stat
     out.table["PValue"] = pvals
@@ -1302,7 +1496,7 @@ def exact_test(
     if not isinstance(object, DGEList):
         raise TypeError("exact_test expects a DGEList.")
     groups = _get_group(object, None)
-    levels = list(pd.unique(groups))
+    levels = _group_levels(object.samples["group"] if "group" in object.samples.columns else groups)
     if pair is None:
         pair = levels[:2]
     if len(pair) != 2:
@@ -1357,7 +1551,8 @@ def exact_test(
 def top_tags(x: DGEExact, n: int | float = 10, adjust_method: str = "BH", sort_by: str = "PValue") -> pd.DataFrame:
     tab = x.table.copy()
     tab["FDR"] = _p_adjust_bh(tab["PValue"].to_numpy()) if adjust_method.upper() == "BH" else tab["PValue"]
-    tab = tab.sort_values(sort_by)
+    if sort_by.lower() != "none":
+        tab = tab.sort_values(sort_by, kind="stable")
     if np.isfinite(n):
         tab = tab.head(int(n))
     return tab
@@ -1467,7 +1662,9 @@ def _estimate_disp_prior_df(
         prior_count=0,
         weights=None if object.weights is None else object.weights.iloc[np.flatnonzero(sel)],
     )
-    df = fit.df_residual
+    from . import _glm_batch as gb
+    zerofit = (fit.counts.to_numpy(dtype=float) < 1e-4) & (fit.fitted_values < 1e-4)
+    df = gb.resid_df(zerofit, np.asarray(design_for_fit, dtype=float))   # edgeR .residDF
     s2 = np.zeros_like(fit.deviance, dtype=float)
     ok = df > 0
     s2[ok] = np.maximum(fit.deviance[ok] / df[ok], 0.0)
@@ -1498,6 +1695,9 @@ def _squeeze_var(
         dfp = df[np.isfinite(df) & (df > 0)]
         if covariate is None and dfp.size and np.nanmin(dfp) == np.nanmax(dfp):
             return _squeeze_var_robust_equal_df(var, df, winsor_tail_p=winsor_tail_p)
+    if not robust:
+        from . import _limma
+        return _limma.squeeze_var(var, df, covariate=covariate)
     n = var.size
     if n < 3:
         return 0.0, var.copy(), var.copy()
@@ -1662,8 +1862,17 @@ def _get_group(x: DGEList, group):
     if group is not None:
         return np.asarray(group)
     if "group" not in x.samples.columns:
-        raise ValueError("DGEList samples must contain a 'group' column or group must be supplied.")
+        return np.ones(x.counts.shape[1])         # R DGEList default: a single group
     return x.samples["group"].to_numpy()
+
+
+def _group_levels(group) -> list:
+    """Levels in R factor order: categorical order if given, else sorted unique values."""
+    g = pd.Series(group)
+    if isinstance(g.dtype, pd.CategoricalDtype):
+        present = set(g.dropna())
+        return [c for c in g.cat.categories if c in present]
+    return sorted(pd.unique(g.dropna()))
 
 
 def _resolve_dispersion(x: DGEList, dispersion):
@@ -1685,33 +1894,13 @@ def _resolve_dispersion(x: DGEList, dispersion):
 
 
 def _one_group_abundance(y: np.ndarray, offset: np.ndarray, dispersion: np.ndarray) -> np.ndarray:
+    """edgeR mglmOneGroup (Fisher scoring, maxit=50, tol=1e-10)."""
+    from . import _glm_batch as gb
     y = np.asarray(y, dtype=float)
-    off = np.asarray(offset, dtype=float)
+    off = np.broadcast_to(np.asarray(offset, dtype=float), y.shape)
     disp = np.asarray(dispersion, dtype=float)
-    if disp.ndim == 0:
-        disp = np.full(y.shape[0], float(disp))
-
-    total = y.sum(axis=1)
-    denom = np.sum(np.exp(off))
-    with np.errstate(divide="ignore"):
-        beta = np.log(total / denom)
-    beta[~np.isfinite(beta)] = -30.0
-
-    exp_off = np.exp(off)
-    for _ in range(50):
-        mu = np.exp(beta[:, None]) * exp_off[None, :]
-        phi = disp[:, None]
-        denom_score = 1.0 + phi * mu
-        score = np.sum((y - mu) / denom_score, axis=1)
-        info = np.sum(mu * (1.0 + phi * y) / (denom_score * denom_score), axis=1)
-        step = score / np.maximum(info, 1e-300)
-        beta_new = beta + step
-        if np.nanmax(np.abs(step)) < 1e-10:
-            beta = beta_new
-            break
-        beta = beta_new
-    beta[total <= 0] = -np.inf
-    return beta
+    phi = np.broadcast_to(disp.reshape(-1, 1) if disp.ndim == 1 else disp, y.shape)
+    return gb.mglm_one_group(y, off, phi, np.ones_like(y), maxit=50, tol=1e-10)
 
 
 def _equalize_for_exact_test(y: np.ndarray, lib_size: np.ndarray, dispersion: np.ndarray) -> np.ndarray:
@@ -1720,9 +1909,7 @@ def _equalize_for_exact_test(y: np.ndarray, lib_size: np.ndarray, dispersion: np
     expr = np.exp(abundance)
     input_mean = expr[:, None] * lib_size[None, :]
     output_mean = np.broadcast_to(expr[:, None] * lib_average, y.shape).copy()
-    pseudo = q2qnbinom(y, input_mean=input_mean, output_mean=output_mean, dispersion=dispersion)
-    pseudo[pseudo < 0] = 0
-    return pseudo
+    return q2qnbinom(y, input_mean=input_mean, output_mean=output_mean, dispersion=dispersion)
 
 
 def _split_into_groups(y: np.ndarray, group: np.ndarray) -> list[np.ndarray]:
@@ -1782,25 +1969,40 @@ def _design_adjusted_profile_loglik_grid(
     grid_length: int,
     grid_range: tuple[float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
+    """estimateDisp.default design branch: Cox-Reid APL on the dispersion grid.
+
+    As in edgeR, observations fitted as exactly zero (at dispersion 0.05) are
+    dropped per zero-pattern group and the design is reduced to an estimable
+    set of columns; fits along the grid are warm-started from the previous
+    grid point.
+    """
+    from . import _glm_batch as gb
     theta = np.linspace(grid_range[0], grid_range[1], grid_length)
     spline_disp = 0.1 * 2.0**theta
+    y = np.asarray(y, dtype=float)
+    off = np.asarray(offset, dtype=float)
+    offset_mat = np.broadcast_to(off, y.shape).astype(float) if off.ndim == 1 else off.astype(float)
+    W = np.ones_like(y) if weights is None else np.asarray(weights, dtype=float)
     l0 = np.zeros((y.shape[0], grid_length), dtype=float)
-    offset_mat = np.broadcast_to(np.asarray(offset, dtype=float)[None, :], y.shape).copy()
-    counts_df = pd.DataFrame(y)
-    weight_mat = None if weights is None else np.asarray(weights, dtype=float)
-    for j, disp in enumerate(spline_disp):
-        fit = glm_fit(
-            counts_df,
-            design=design,
-            dispersion=float(disp),
-            offset=offset_mat,
-            prior_count=0,
-            weights=weight_mat,
-        )
-        mu = fit.fitted_values
-        for i in range(y.shape[0]):
-            wi = None if weight_mat is None else weight_mat[i]
-            l0[i, j] = _adjusted_profile_loglik_row(y[i], mu[i], design, float(disp), weights=wi)
+    _, fitted0, _ = _fit_glm_batch(y, design, offset_mat, np.full_like(y, 0.05), W)
+    zerofit = (y < 1e-4) & (fitted0 < 1e-4)
+    for subg in gb.combo_groups(zerofit):
+        nz = ~zerofit[subg[0]]
+        if not nz.any():
+            continue
+        if nz.all():
+            redesign = design
+        else:
+            redesign = design[nz]
+            redesign = redesign[:, gb.qr_rank_columns(redesign)]
+            if redesign.shape[0] == redesign.shape[1]:
+                continue
+        cy, co, cw = y[np.ix_(subg, nz)], offset_mat[np.ix_(subg, nz)], W[np.ix_(subg, nz)]
+        last = None
+        for j, disp in enumerate(spline_disp):
+            phi = np.full_like(cy, disp)
+            last, mu, _ = _fit_glm_batch(cy, redesign, co, phi, cw, start=last)
+            l0[subg, j] = gb.compute_apl(cy, mu, phi, cw, redesign)
     return theta, l0
 
 
@@ -1822,27 +2024,13 @@ def _adjusted_profile_loglik_row(y: np.ndarray, mu: np.ndarray, design: np.ndarr
 
 
 def _maximize_interpolant(theta: np.ndarray, loglik: np.ndarray) -> np.ndarray:
-    theta = np.asarray(theta, dtype=float)
-    y = np.asarray(loglik, dtype=float)
-    if y.ndim == 1:
-        y = y[None, :]
-    out = np.empty(y.shape[0], dtype=float)
-    for i, row in enumerate(y):
-        if not np.any(np.isfinite(row)):
-            out[i] = np.nan
-            continue
-        j = int(np.nanargmax(row))
-        if j == 0 or j == row.size - 1:
-            out[i] = theta[j]
-            continue
-        x3 = theta[j - 1 : j + 2]
-        y3 = row[j - 1 : j + 2]
-        a, b, _ = np.polyfit(x3, y3, deg=2)
-        if a < 0 and np.isfinite(a) and np.isfinite(b):
-            candidate = -b / (2.0 * a)
-            out[i] = float(np.clip(candidate, x3[0], x3[-1]))
-        else:
-            out[i] = theta[j]
+    """edgeR maximizeInterpolant: maximum of the FMM cubic spline through each row."""
+    from . import _glm_batch as gb
+    y = np.atleast_2d(np.asarray(loglik, dtype=float))
+    out = np.full(y.shape[0], np.nan)
+    ok = np.isfinite(y).all(axis=1)
+    if ok.any():
+        out[ok] = gb.maximize_interpolant(theta, y[ok])
     return out
 
 
@@ -1936,54 +2124,11 @@ def _locfit_by_col(
     x: np.ndarray | None = None,
     span: float = 0.5,
     degree: int = 0,
+    weights=None,
 ) -> np.ndarray:
-    """Local polynomial smoother used as a Python-native locfit substitute."""
-
-    y = np.asarray(y, dtype=float)
-    if y.ndim == 1:
-        y = y[:, None]
-    n = y.shape[0]
-    if x is None:
-        x = np.arange(1, n + 1, dtype=float)
-    else:
-        x = np.asarray(x, dtype=float)
-    if x.size != n:
-        raise ValueError("x length must match y rows.")
-    if span * n < 2 or n <= 1:
-        return y.copy()
-    degree = int(degree)
-    if degree not in {0, 1}:
-        raise ValueError("degree must be 0 or 1.")
-    nspan = min(max(int(np.ceil(span * n)), 2), n)
-    fitted = np.empty_like(y, dtype=float)
-    for i in range(n):
-        dist = np.abs(x - x[i])
-        order = np.argsort(dist, kind="mergesort")
-        keep = order[:nspan]
-        dmax = float(dist[keep[-1]])
-        if dmax <= 0:
-            weights = np.ones(keep.size, dtype=float)
-        else:
-            u = dist[keep] / dmax
-            weights = (1.0 - u**3) ** 3
-            weights[u >= 1.0] = 0.0
-            if not np.any(weights > 0):
-                weights = np.ones(keep.size, dtype=float)
-        if degree == 0:
-            denom = np.sum(weights)
-            fitted[i] = np.sum(y[keep] * weights[:, None], axis=0) / denom
-        else:
-            x_center = x[keep] - x[i]
-            X = np.column_stack([np.ones(keep.size), x_center])
-            WX = X * weights[:, None]
-            xtwx = X.T @ WX
-            xtwy = WX.T @ y[keep]
-            try:
-                beta = np.linalg.solve(xtwx, xtwy)
-            except np.linalg.LinAlgError:
-                beta = np.linalg.pinv(xtwx) @ xtwy
-            fitted[i] = beta[0]
-    return fitted
+    """edgeR locfitByCol, reproducing the R locfit package (tree evaluation + interpolation)."""
+    from ._locfit import locfit_by_col
+    return locfit_by_col(y, x=x, weights=weights, span=span, degree=degree)
 
 
 def _average_ql_dispersion(s2: np.ndarray, df: np.ndarray, ave_log_cpm: np.ndarray) -> float:
@@ -2028,17 +2173,20 @@ def q2qnbinom(x, input_mean, output_mean, dispersion=0):
     q1 = np.empty_like(x, dtype=float)
     q2 = np.empty_like(x, dtype=float)
 
+    sdi, sdo = np.sqrt(vi), np.sqrt(vo)
     if np.any(above):
-        p1[above] = stats.norm.logsf(x[above], loc=input_mean[above], scale=np.sqrt(vi[above]))
-        p2[above] = stats.gamma.logsf(x[above], a=(input_mean / ri)[above], scale=ri[above])
-        q1[above] = stats.norm.isf(np.exp(p1[above]), loc=output_mean[above], scale=np.sqrt(vo[above]))
-        q2[above] = stats.gamma.isf(np.exp(p2[above]), a=(output_mean / ro)[above], scale=ro[above])
+        a = above
+        p1[a] = special.log_ndtr(-(x[a] - input_mean[a]) / sdi[a])                       # pnorm(upper, log)
+        p2[a] = np.log(special.gammaincc(input_mean[a] / ri[a], x[a] / ri[a]))           # pgamma(upper, log)
+        q1[a] = output_mean[a] - sdo[a] * special.ndtri_exp(p1[a])                       # qnorm(upper, log)
+        q2[a] = special.gammainccinv(output_mean[a] / ro[a], np.exp(p2[a])) * ro[a]      # qgamma(upper, log)
     below = ~above
     if np.any(below):
-        p1[below] = stats.norm.logcdf(x[below], loc=input_mean[below], scale=np.sqrt(vi[below]))
-        p2[below] = stats.gamma.logcdf(x[below], a=(input_mean / ri)[below], scale=ri[below])
-        q1[below] = stats.norm.ppf(np.exp(p1[below]), loc=output_mean[below], scale=np.sqrt(vo[below]))
-        q2[below] = stats.gamma.ppf(np.exp(p2[below]), a=(output_mean / ro)[below], scale=ro[below])
+        b = below
+        p1[b] = special.log_ndtr((x[b] - input_mean[b]) / sdi[b])
+        p2[b] = np.log(special.gammainc(input_mean[b] / ri[b], x[b] / ri[b]))
+        q1[b] = output_mean[b] + sdo[b] * special.ndtri_exp(p1[b])
+        q2[b] = special.gammaincinv(output_mean[b] / ro[b], np.exp(p2[b])) * ro[b]
     out = (q1 + q2) / 2.0
     return out
 
