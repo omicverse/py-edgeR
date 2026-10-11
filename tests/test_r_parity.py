@@ -194,3 +194,19 @@ def test_infinite_prior_df():
     assert np.isinf(y.prior_df) and np.isinf(r["prior_df"][0])
     _close(y.tagwise_dispersion, r["tagwise"], rtol=1e-9)
     _close(pyedger.glmLRT(pyedger.glmFit(y), coef="treatment").table["PValue"], r["PValue"], rtol=1e-8)
+
+
+def test_limma_hyperparameters():
+    # limma 3.68: fitFDistRobustly (equal / unequal df1, covariate) and
+    # squeezeVar choosing fitFDistUnequalDF1 for unequal df (robust, covariate).
+    from pyedger import _limma
+    i, r = _read("limma_in.tsv"), _read("limma_out.tsv")
+    x, cov, du = i["x"].to_numpy(), i["cov"].to_numpy(), i["df1u"].to_numpy(float)
+    for k, fit in [(1, _limma.fit_f_dist_robustly(x, 4.0)), (2, _limma.fit_f_dist_robustly(x, 4.0, covariate=cov)),
+                   (3, _limma.fit_f_dist_robustly(x, du))]:
+        _close(np.broadcast_to(fit["scale"], len(r)), r[f"s{k}"], rtol=1e-9)
+        _close(fit["df2_shrunk"], r[f"d{k}"], rtol=1e-9)
+    for k, kw in [(4, dict(robust=True)), (5, dict(covariate=cov, robust=True)), (6, dict(covariate=cov))]:
+        dp, _, post = _limma.squeeze_var(x, du, **kw)
+        _close(post, r[f"p{k}"], rtol=1e-9)
+        _close(np.broadcast_to(dp, len(r)), r[f"d{k}"], rtol=1e-9)

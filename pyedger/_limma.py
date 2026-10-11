@@ -458,6 +458,210 @@ def fit_f_dist_unequal_df1(x, df1, covariate=None, span=None, robust=False, prio
     return dict(scale=s20, df2=df2, df2_outlier=df2_outlier, df2_shrunk=shrunk)
 
 
+def r_zeroin2(f, ax, bx, fa, fb, tol=1e-8, maxit=1000):
+    """R stats zeroin.c R_zeroin2 (Brent root finder used by uniroot)."""
+    eps = np.finfo(float).eps
+    a, b = ax, bx
+    c, fc = a, fa
+    if fa == 0.0:
+        return a
+    if fb == 0.0:
+        return b
+    for _ in range(maxit + 1):
+        prev_step = b - a
+        if abs(fc) < abs(fb):
+            a, b, c = b, c, b
+            fa, fb, fc = fb, fc, fb
+        tol_act = 2 * eps * abs(b) + tol / 2
+        new_step = (c - b) / 2
+        if abs(new_step) <= tol_act or fb == 0.0:
+            return b
+        if abs(prev_step) >= tol_act and abs(fa) > abs(fb):
+            cb = c - b
+            if a == c:
+                t1 = fb / fa
+                p = cb * t1
+                q = 1.0 - t1
+            else:
+                q = fa / fc; t1 = fb / fc; t2 = fb / fa
+                p = t2 * (cb * q * (q - t1) - (b - a) * (t1 - 1.0))
+                q = (q - 1.0) * (t1 - 1.0) * (t2 - 1.0)
+            if p > 0:
+                q = -q
+            else:
+                p = -p
+            if p < (0.75 * cb * q - abs(tol_act * q) / 2) and p < abs(prev_step * q / 2):
+                new_step = p / q
+        if abs(new_step) < tol_act:
+            new_step = tol_act if new_step > 0 else -tol_act
+        a, fa = b, fb
+        b += new_step
+        fb = f(b)
+        if (fb > 0 and fc > 0) or (fb < 0 and fc < 0):
+            c, fc = a, fa
+    return b
+
+
+def _trimmed_mean(x, trim):
+    """R mean(x, trim=)."""
+    x = np.sort(np.asarray(x, dtype=float))
+    n = x.size
+    lo = int(np.floor(n * trim))
+    return float(np.mean(x[lo:n - lo]))
+
+
+def _qf(p, df1, df2, lower=True, log=False):
+    p = np.exp(p) if log else np.asarray(p, dtype=float)
+    if np.isinf(df2):
+        return (stats.chi2.ppf(p, df1) if lower else stats.chi2.isf(p, df1)) / df1
+    return stats.f.ppf(p, df1, df2) if lower else stats.f.isf(p, df1, df2)
+
+
+def _df(x, df1, df2):
+    if np.isinf(df2):
+        return stats.chi2.pdf(x * df1, df1) * df1
+    return stats.f.pdf(x, df1, df2)
+
+
+def fit_f_dist_robustly(x, df1, covariate=None, winsor_tail_p=(0.05, 0.1)):
+    """limma::fitFDistRobustly (limma 3.68). Returns dict(scale, df2, df2_shrunk)."""
+    from ._ql_adjust import r_lowess
+    x = np.asarray(x, dtype=float).copy()
+    n = x.size
+    if n < 2:
+        return dict(scale=np.nan, df2=np.nan, df2_shrunk=np.nan)
+    df1 = np.asarray(df1, dtype=float)
+    if n == 2:
+        s20, d2 = fit_f_dist(x, df1, covariate=covariate)
+        return dict(scale=s20, df2=d2)
+    df1v = np.broadcast_to(df1, (n,))
+    ok = ~np.isnan(x) & np.isfinite(df1v) & (df1v > 1e-6)
+    if not np.all(ok):
+        cov = None if covariate is None else np.asarray(covariate, dtype=float)
+        fit = fit_f_dist_robustly(x[ok], df1v[ok] if df1.size > 1 else df1, None if cov is None else cov[ok], winsor_tail_p)
+        shr = x.copy()
+        shr[ok] = fit["df2_shrunk"]
+        shr[~ok] = fit["df2"]
+        if cov is None:
+            scale = fit["scale"]
+        else:
+            scale = x.copy()
+            scale[ok] = fit["scale"]
+            xo = cov[ok]; o = np.argsort(xo, kind="stable")
+            scale[~ok] = np.exp(np.interp(cov[~ok], xo[o], np.log(np.asarray(fit["scale"])[o])))
+        return dict(scale=scale, df2=fit["df2"], df2_shrunk=shr)
+    m = np.median(x)
+    if m <= 0:
+        raise ValueError("Variances are mostly <= 0")
+    x[x < m * 1e-12] = m * 1e-12
+    nr_s20, nr_df2 = fit_f_dist(x, df1, covariate=covariate)
+    wtp = np.resize(np.asarray(winsor_tail_p, dtype=float), 2)
+    prob = np.array([wtp[0], 1 - wtp[1]])
+    if np.all(wtp < 1 / n):
+        return dict(scale=nr_s20, df2=nr_df2, df2_shrunk=np.full(n, nr_df2))
+    if df1.size > 1:
+        df1max = np.max(df1)
+        i = df1 < (df1max - 1e-14)
+        if np.any(i):
+            sc = nr_s20 if covariate is None else np.asarray(nr_s20)[i]
+            f = x[i] / sc
+            pu = stats.f.logsf(f, df1[i], nr_df2)
+            pl = stats.f.logcdf(f, df1[i], nr_df2)
+            up = pu < pl
+            f[up] = _qf(pu[up], df1max, nr_df2, lower=False, log=True)
+            f[~up] = _qf(pl[~up], df1max, nr_df2, lower=True, log=True)
+            x[i] = f * sc
+        d1 = float(df1max)
+    else:
+        d1 = float(df1)
+    z = np.log(x)
+    if covariate is None:
+        ztrend = _trimmed_mean(z, wtp[1])
+        zresid = z - ztrend
+    else:
+        cov = np.asarray(covariate, dtype=float)
+        o = _r_order(cov)
+        _, lo = r_lowess(cov, z, f=0.4, iter=3)
+        ztrend = np.empty(n); ztrend[o] = lo
+        zresid = z - ztrend
+    zrq = np.quantile(zresid, prob, method="linear")
+    zw = np.minimum(np.maximum(zresid, zrq[0]), zrq[1])
+    zwmean = np.mean(zw)
+    zwvar = np.mean((zw - zwmean) ** 2) * n / (n - 1)
+    gn, gw = np.polynomial.legendre.leggauss(128)
+    gn, gw = (gn + 1) / 2, gw / 2
+
+    def moments(df2):
+        fq = _qf(np.array([wtp[0], 1 - wtp[1]]), d1, df2)
+        zq = np.log(fq)
+        q = fq / (1 + fq)
+        nodes = q[0] + (q[1] - q[0]) * gn
+        fn = nodes / (1 - nodes)
+        zn = np.log(fn)
+        dens = _df(fn, d1, df2) / (1 - nodes) ** 2
+        q21 = q[1] - q[0]
+        mm = q21 * np.sum(gw * dens * zn) + np.sum(zq * wtp)
+        vv = q21 * np.sum(gw * dens * (zn - mm) ** 2) + np.sum((zq - mm) ** 2 * wtp)
+        return mm, vv
+
+    mom_m, mom_v = moments(np.inf)
+    fval_inf = np.log(zwvar / mom_v)
+    if fval_inf <= 0:
+        ztc = ztrend + zwmean - mom_m
+        s20 = np.exp(ztc)
+        fstat = np.exp(z - ztc)
+        tailp = stats.chi2.sf(fstat * d1, d1)
+        r = stats.rankdata(fstat)
+        pno = np.minimum(tailp / ((n - r + 0.5) / n), 1)
+        shr = np.full(n, np.inf)
+        O = pno < 1
+        if np.any(O):
+            shr[O] = pno[O] * n * d1
+            o = np.argsort(tailp, kind="stable")
+            shr[o] = np.maximum.accumulate(shr[o])
+        return dict(scale=s20, df2=np.inf, df2_shrunk=shr)
+
+    def fun(u):
+        return np.log(zwvar / moments(u / (1 - u))[1])
+
+    if np.isinf(nr_df2):
+        return dict(scale=nr_s20, df2=nr_df2, df2_shrunk=np.full(n, nr_df2))
+    rbx = nr_df2 / (1 + nr_df2)
+    flow = fun(rbx)
+    if flow >= 0:
+        df2 = nr_df2
+    else:
+        u = r_zeroin2(fun, rbx, 1.0, flow, fval_inf, tol=1e-8)
+        df2 = u / (1 - u)
+    mom_m, _ = moments(df2)
+    ztc = ztrend + zwmean - mom_m
+    s20 = np.exp(ztc)
+    fstat = np.exp(z - ztc)
+    ltp = stats.f.logsf(fstat, d1, df2)
+    r = stats.rankdata(fstat)
+    lpno = np.minimum(ltp - (np.log(n - r + 0.5) - np.log(n)), 0)
+    pno = np.exp(lpno)
+    pout = -np.expm1(lpno)
+    if np.any(lpno < 0):
+        mn = np.min(ltp)
+        if mn == -np.inf:
+            shr = pno * df2
+        else:
+            dfo = np.log(0.5) / mn * df2
+            new = stats.f.logsf(np.max(fstat), d1, dfo)
+            dfo = np.log(0.5) / new * dfo
+            shr = pno * df2 + pout * dfo
+        o = np.argsort(ltp, kind="stable")
+        ordered = shr[o]
+        mm = np.cumsum(ordered) / np.arange(1, n + 1)
+        imin = int(np.argmin(mm))
+        ordered[: imin + 1] = mm[imin]
+        shr[o] = np.maximum.accumulate(ordered)
+    else:
+        shr = np.full(n, df2)
+    return dict(scale=s20, df2=df2, df2_shrunk=shr)
+
+
 def _squeeze_post(var, df, var_prior, df_prior):
     """limma .squeezeVar."""
     dfp = np.asarray(df_prior, dtype=float)
@@ -474,12 +678,12 @@ def _squeeze_post(var, df, var_prior, df_prior):
     return post
 
 
-def squeeze_var(var, df, covariate=None, span=None, robust=False, legacy=None):
+def squeeze_var(var, df, covariate=None, span=None, robust=False, winsor_tail_p=(0.05, 0.1), legacy=None):
     """limma::squeezeVar (limma 3.68). Returns (df_prior, var_prior, var_post).
 
     ``legacy=None`` uses fitFDist when the positive residual df are all equal
-    and fitFDistUnequalDF1 otherwise. Robust estimation is implemented for the
-    unequal-df method only.
+    and fitFDistUnequalDF1 otherwise; ``robust=True`` uses fitFDistRobustly
+    or the robust fitFDistUnequalDF1 respectively.
     """
     var = np.asarray(var, dtype=float).copy()
     df = np.asarray(df, dtype=float)
@@ -497,8 +701,10 @@ def squeeze_var(var, df, covariate=None, span=None, robust=False, legacy=None):
         legacy = bool(np.min(dfp) == np.max(dfp))
     if legacy:
         if robust:
-            raise NotImplementedError("robust=True with equal residual df (fitFDistRobustly)")
-        s20, df_prior = fit_f_dist(var, df, covariate=covariate)
+            fit = fit_f_dist_robustly(var, df, covariate=covariate, winsor_tail_p=winsor_tail_p)
+            s20, df_prior = fit["scale"], fit["df2_shrunk"]
+        else:
+            s20, df_prior = fit_f_dist(var, df, covariate=covariate)
     else:
         fit = fit_f_dist_unequal_df1(var, df, covariate=covariate, span=span, robust=robust)
         s20 = fit["scale"]

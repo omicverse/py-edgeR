@@ -12,7 +12,7 @@
 #   X <- matrix(rnbinom(length(mu), mu = mu, size = 1 / 0.08), ng)
 #   X[sample(ng, 30), c(1, 2)] <- 0        # pairs with all-zero libraries -> zero fits
 # It is read back here so the reference does not depend on the RNG of the R version.
-suppressMessages(library(edgeR))
+suppressMessages({library(edgeR); library(limma)})
 d <- "tests/data"
 w <- function(x, f) write.table(x, file.path(d, f), sep = "\t", quote = FALSE, row.names = FALSE)
 X <- as.matrix(read.delim(file.path(d, "counts.tsv"), row.names = 1))
@@ -86,3 +86,15 @@ nx <- read.delim(file.path(d, "no_extra_var.tsv"))
 yn <- estimateDisp(normLibSizes(DGEList(as.matrix(nx[, 1:6]), group = factor(rep(c("treatment", "control"), each = 3)))))
 w(data.frame(prior_df = yn$prior.df, tagwise = yn$tagwise.dispersion,
              PValue = glmLRT(glmFit(yn), coef = 2)$table$PValue), "no_extra_var_ref.tsv")
+
+# 6) limma 3.68 hyperparameter estimation (robust / unequal df / covariate)
+set.seed(3); n <- 2000; cov <- rnorm(n)
+x <- exp(0.3 * cov) * rchisq(n, 4) / 4 / (rchisq(n, 8) / 8); x[1:20] <- x[1:20] * 30
+df1u <- sample(c(3, 4), n, TRUE)
+w(data.frame(x = sprintf("%.17g", x), cov = sprintf("%.17g", cov), df1u = df1u), "limma_in.tsv")
+o <- list(fitFDistRobustly(x, 4), fitFDistRobustly(x, 4, covariate = cov), fitFDistRobustly(x, df1u),
+          squeezeVar(x, df1u, robust = TRUE), squeezeVar(x, df1u, covariate = cov, robust = TRUE), squeezeVar(x, df1u, covariate = cov))
+w(data.frame(s1 = rep_len(o[[1]]$scale, n), d1 = o[[1]]$df2.shrunk, s2 = o[[2]]$scale, d2 = o[[2]]$df2.shrunk,
+             s3 = rep_len(o[[3]]$scale, n), d3 = o[[3]]$df2.shrunk,
+             p4 = o[[4]]$var.post, d4 = rep_len(o[[4]]$df.prior, n), p5 = o[[5]]$var.post, d5 = rep_len(o[[5]]$df.prior, n),
+             p6 = o[[6]]$var.post, d6 = rep_len(o[[6]]$df.prior, n)), "limma_out.tsv")
