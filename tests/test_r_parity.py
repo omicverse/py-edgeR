@@ -89,7 +89,21 @@ def test_design_ql(setup, legacy):
     X, cond, D = setup
     y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
     fit = pyedger.glmQLFit(y, D, legacy=legacy)
-    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, f"design_ql_legacy{int(legacy)}")
+    # legacy=False estimates the NB dispersion by Cox-Reid on the top genes (R's
+    # optimize(tol=1e-5)), so it agrees with R only to the Cox-Reid level; see
+    # test_design_ql_given_dispersion for the exact check of the rest.
+    rtol, atol = (RTOL, 1e-7) if legacy else (RTOL_COXREID, 1e-5)
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, f"design_ql_legacy{int(legacy)}", rtol, atol)
+
+
+def test_design_ql_given_dispersion(setup):
+    # New QL method with R's Cox-Reid dispersion supplied: everything downstream
+    # (average QL dispersion, adjusted deviance/df, squeezeVar, F-test) is exact.
+    X, cond, D = setup
+    y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
+    disp = _read("design_ql_legacy0_scalar.tsv")["dispersion"][0]
+    fit = pyedger.glmQLFit(y, D, dispersion=disp)
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_legacy0", RTOL, 1e-9)
 
 
 def test_design_ql_without_dispersion(setup):
@@ -97,7 +111,7 @@ def test_design_ql_without_dispersion(setup):
     # DGEList carries dispersion estimates.
     X, cond, D = setup
     fit = pyedger.glmQLFit(_dge(X, cond), D)
-    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_nodisp")
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_nodisp", RTOL_COXREID, 1e-5)
 
 
 def test_design_ql_options(setup):
