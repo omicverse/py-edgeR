@@ -695,27 +695,21 @@ def estimate_disp(
             winsor_tail_p=winsor_tail_p,
         )
     prior_n = np.asarray(prior_df, dtype=float) / max(nlibs - ncoefs, 1)
-    if prior_n.ndim == 0:
-        prior_n_for_fit = float(prior_n)
-        individual = _maximize_interpolant(theta, l0 + prior_n_for_fit * m0)
-    else:
-        prior_n_sel = prior_n[sel] if prior_n.size == y.shape[0] else prior_n
-        temp_n = prior_n_sel.copy()
-        too_large = temp_n > 1e6
-        temp_n[too_large] = 1e6
-        individual = _maximize_interpolant(theta, l0 + temp_n[:, None] * m0)
     if trend_method in {"movingave", "loess", "locfit", "locfit.mixed"}:
         tagwise_disp = object.trended_dispersion.copy()
     else:
         tagwise_disp = np.full(y.shape[0], object.common_dispersion)
-    if np.asarray(prior_n).ndim == 0:
-        tagwise_disp[sel] = 0.1 * 2.0**individual
-    else:
-        prior_n_sel = prior_n[sel] if prior_n.size == y.shape[0] else prior_n
-        update = prior_n_sel <= 1e6
-        tagwise_disp_sel = tagwise_disp[sel]
-        tagwise_disp_sel[update] = 0.1 * 2.0**individual[update]
-        tagwise_disp[sel] = tagwise_disp_sel
+    # edgeR: near-infinite shrinkage (prior.n > 1e6, e.g. prior.df = Inf when
+    # the data show no extra variability) leaves tagwise at the trend/common.
+    prior_n_sel = prior_n[sel] if prior_n.ndim and prior_n.size == y.shape[0] else prior_n
+    too_large = np.broadcast_to(prior_n_sel > 1e6, (int(np.sum(sel)),))
+    if not np.all(too_large):
+        temp_n = np.where(too_large, 1e6, prior_n_sel)
+        individual = _maximize_interpolant(theta, l0 + temp_n[:, None] * m0)
+        tagwise_sel = tagwise_disp[sel]
+        upd = ~too_large if robust else np.ones_like(too_large)
+        tagwise_sel[upd] = 0.1 * 2.0 ** individual[upd]
+        tagwise_disp[sel] = tagwise_sel
     object.tagwise_dispersion = tagwise_disp
     object.prior_df = float(prior_df) if np.asarray(prior_df).ndim == 0 else np.asarray(prior_df, dtype=float)
     object.prior_n = float(prior_n) if np.asarray(prior_n).ndim == 0 else np.asarray(prior_n, dtype=float)
