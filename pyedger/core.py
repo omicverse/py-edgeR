@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 from scipy import optimize, special, stats
 from scipy.stats import rankdata
-from statsmodels.nonparametric.smoothers_lowess import lowess
 
 
 def _as_weight_matrix(weights, shape: tuple[int, int], row_index=None, col_index=None) -> pd.DataFrame:
@@ -2093,19 +2092,6 @@ def _locfit_by_col(
     """edgeR locfitByCol, reproducing the R locfit package (tree evaluation + interpolation)."""
     from ._locfit import locfit_by_col
     return locfit_by_col(y, x=x, weights=weights, span=span, degree=degree)
-
-
-def _average_ql_dispersion(s2: np.ndarray, df: np.ndarray, ave_log_cpm: np.ndarray) -> float:
-    ok = np.isfinite(s2) & (s2 > 0) & np.isfinite(df) & (df > 1e-8)
-    if not np.any(ok):
-        return 1.0
-    y = np.sqrt(np.sqrt(s2[ok]))
-    x = np.asarray(ave_log_cpm, dtype=float)[ok]
-    # edgeR uses lowess f=0.5, iter=3 and the 90% quantile of the trend,
-    # bounded below by 1 on the QL dispersion scale.
-    line = lowess(y, x, frac=0.5, it=3, delta=0.01 * (np.max(x) - np.min(x)), return_sorted=False)
-    q = float(np.quantile(line, 0.9, method="linear"))
-    return max(q**4, 1.0)
 
 
 def q2qnbinom(x, input_mean, output_mean, dispersion=0):

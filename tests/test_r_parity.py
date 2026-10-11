@@ -129,7 +129,8 @@ def test_design_ql_options(setup):
     X, cond, D = setup
     y = pyedger.estimateDisp(_dge(X, cond), design=D.to_numpy())
     fit = pyedger.glmQLFit(y, D, top_proportion=0.2, abundance_trend=False)
-    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_top02_notrend")
+    # the NB dispersion is estimated by Cox-Reid on the top genes (RTOL_COXREID)
+    _check_ql(fit, pyedger.glmQLFTest(fit, coef=D.shape[1] - 1).table, "design_ql_top02_notrend", RTOL_COXREID, 1e-5)
 
 
 def test_classic_path(setup):

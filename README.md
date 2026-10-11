@@ -13,7 +13,8 @@ A **pure-Python port of [Bioconductor edgeR](https://bioconductor.org/packages/r
 ## Install
 
 ```bash
-pip install pyedger
+pip install pyedger          # NumPy implementation
+pip install "pyedger[fast]"  # + numba kernels (several times faster, parallel over genes)
 ```
 
 ## Quick start

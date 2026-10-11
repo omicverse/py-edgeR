@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- **Speed:** optional numba kernels (`pip install pyedger[fast]`) for the Levenberg GLM fits, the adjusted profile likelihood, the new-QL adjustments (`compute_adj_vec` / `compute_adj_mat` / `compute_ave_qd`), the QL prior lowess and one-group fits. They follow edgeR's C code gene by gene and run in parallel over genes (threads: `NUMBA_NUM_THREADS`). On 167k features x 26 samples with a 14-column design the full `estimateDisp` + `glmQLFit` pipeline went from ~5 min to ~1 min (8 threads); edgeR 4.10.5 takes ~8 min single-threaded. Without numba (or with `PYEDGER_NO_NUMBA=1`) the NumPy implementation is used. Results agree with the NumPy path to ~1e-15 per kernel and with R as before (identical FDR calls on the GSE274113 checks).
+- Removed an unused statsmodels import (statsmodels was never a declared dependency).
+
 ## 0.2.0
 
 pyedger now targets **edgeR 4.10.5 / limma 3.68.5** (Bioconductor 3.23) instead of edgeR 4.0.16. Results change wherever edgeR changed between those releases; parity tests were regenerated with R 4.5.3.
