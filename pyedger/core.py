@@ -996,6 +996,78 @@ def _fit_glm_batch(counts, X, offset_mat, phi_mat, W, start=None):
     return beta, mu, dev
 
 
+def glm_residuals(glmfit: DGEGLM, type: str = "pearson") -> np.ndarray:
+    """Observation residuals of a fitted NB GLM (``pearson`` / ``deviance`` / ``anscombe``)."""
+    y = glmfit.counts.to_numpy(dtype=float)
+    mu = np.asarray(glmfit.fitted_values, dtype=float)
+    disp = np.asarray(glmfit.dispersion, dtype=float)
+    phi = np.broadcast_to(disp.reshape(-1, 1) if disp.ndim else disp, y.shape)
+    type = type.lower()
+    if type == "pearson":
+        return (y - mu) / np.sqrt(np.maximum(mu + phi * mu * mu, 1e-300))
+    if type == "deviance":
+        unit = _nbinom_unit_deviance(y, mu, phi)
+        return np.sign(y - mu) * np.sqrt(unit)
+    if type == "anscombe":
+        # Anscombe residual for the NB family (Hilbe 2011), integral evaluated numerically.
+        def a(t, ph):
+            grid = np.linspace(0.0, 1.0, 65)[None, :]
+            s_ = np.maximum(t[:, None] * grid, 1e-12)
+            f = (s_ + ph[:, None] * s_ * s_) ** (-1.0 / 3.0)
+            trap = getattr(np, "trapezoid", None) or np.trapz
+            return trap(f, grid[0], axis=1) * t
+        yf, mf, pf = y.ravel(), mu.ravel(), phi.ravel()
+        res = (a(yf, pf) - a(mf, pf)) / ((mf + pf * mf * mf) ** (1.0 / 6.0) + 1e-300)
+        return res.reshape(y.shape)
+    raise ValueError("type must be 'pearson', 'deviance' or 'anscombe'.")
+
+
+def estimate_glm_robust_disp(
+    y: DGEList,
+    design=None,
+    prior_df: float = 10.0,
+    update_trend: bool = True,
+    trend_method: str = "bin.loess",
+    maxit: int = 6,
+    k: float = 1.345,
+    residual_type: str = "pearson",
+    record: bool = False,
+) -> DGEList:
+    """Observation-weighted robust dispersion, mirroring ``edgeR::estimateGLMRobustDisp``.
+
+    Alternates GLM fits with Huber observation weights ``min(1, k / |r|)`` on
+    the fitted residuals ``r`` and re-estimates the trended and tagwise
+    dispersions with those weights (Zhou, Lindsay & Robinson 2014, NAR). The
+    final weights are kept in ``y.weights`` so a following :func:`glm_fit` /
+    :func:`glm_lrt` down-weights isolated aberrant observations.
+    """
+    if not isinstance(y, DGEList):
+        y = DGEList(y)
+    if design is None:
+        design = _default_design_from_group(y)
+    y.weights = pd.DataFrame(np.ones(y.counts.shape), index=y.counts.index, columns=y.counts.columns)
+    if y.trended_dispersion is None:
+        estimate_glm_trended_disp(y, design=design, method=trend_method)
+    if y.tagwise_dispersion is None:
+        estimate_glm_tagwise_disp(y, design=design, prior_df=prior_df)
+    history = []
+    for _ in range(int(maxit)):
+        fit = glm_fit(y, design=design, dispersion=y.tagwise_dispersion, prior_count=0)
+        res = glm_residuals(fit, type=residual_type)
+        res = np.where(np.isfinite(res), res, 0.0)
+        ares = np.abs(res)
+        wts = np.where(ares <= k, 1.0, k / np.maximum(ares, 1e-300))
+        y.weights = pd.DataFrame(wts, index=y.counts.index, columns=y.counts.columns)
+        if update_trend:
+            estimate_glm_trended_disp(y, design=design, method=trend_method)
+        estimate_glm_tagwise_disp(y, design=design, prior_df=prior_df)
+        if record:
+            history.append({"weights": wts.copy(), "tagwise_dispersion": np.asarray(y.tagwise_dispersion).copy()})
+    if record:
+        y.record = history
+    return y
+
+
 def pred_fc(y, design, prior_count: float = 0.125, offset=None, dispersion=None, weights=None) -> pd.DataFrame:
     """edgeR-style prior-count shrunken GLM coefficients on log2 scale."""
 
