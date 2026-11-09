@@ -1,0 +1,9 @@
+task	engine	AveLogCPM	trended	tagwise	ql_logFC	ql_F	ql_PValue	ql_FDR	ql_s2post	lrt_logFC	lrt_LR	lrt_PValue	lrt_FDR	et_logFC	et_PValue	et_FDR
+full_BRCA	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_COAD	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_KIRC	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_LIHC	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_LUAD	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_LUSC	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_PRAD	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+full_THCA	pyedger_numba8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0

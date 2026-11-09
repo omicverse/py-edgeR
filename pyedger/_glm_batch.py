@@ -11,11 +11,62 @@ R/mglmOneWay.R, R/designAsFactor.R, R/residDF.R, R/comboGroups.R.
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 from scipy import special
 
 LOW_VALUE = 1e-10            # utils.h low_value
 LOG_LOW_VALUE = np.log(LOW_VALUE)
+
+
+# --------------------------------------------------------------------------- threading
+def n_threads() -> int:
+    """Threads for row-block parallelism: PYEDGER_NUM_THREADS, else numba's setting, else 1."""
+    env = os.environ.get("PYEDGER_NUM_THREADS")
+    if env:
+        return max(1, int(env))
+    from . import _numba_kernels as nk
+    if nk.HAVE_NUMBA:
+        import numba
+        return max(1, int(numba.get_num_threads()))
+    return 1
+
+
+def block_map(fn, n, min_rows=1000):
+    """Call ``fn(slice)`` on contiguous row blocks on a thread pool and concatenate the results."""
+    nt = n_threads()
+    if nt == 1 or n < 2 * min_rows:
+        return fn(slice(0, n))
+    nblk = min(nt * 4, n // min_rows)
+    edges = np.linspace(0, n, nblk + 1).astype(int)
+    with ThreadPoolExecutor(nt) as ex:
+        res = list(ex.map(fn, [slice(a, b) for a, b in zip(edges[:-1], edges[1:])]))
+    if isinstance(res[0], tuple):
+        return tuple(np.concatenate(parts, axis=0) for parts in zip(*res))
+    return np.concatenate(res, axis=0)
+
+
+def row_parallel(fn, n, *args, min_rows=1000):
+    """Apply ``fn`` to contiguous row blocks of the (n, ...) array arguments on a thread pool.
+
+    NumPy/SciPy ufuncs release the GIL, so vectorised code on separate blocks runs
+    on separate cores. Arguments whose first dimension is not ``n`` are passed whole.
+    Outputs (an array or a tuple of arrays) are concatenated along the rows.
+    """
+    nt = n_threads()
+    if nt == 1 or n < 2 * min_rows:
+        return fn(*args)
+    nblk = min(nt * 4, n // min_rows)
+    edges = np.linspace(0, n, nblk + 1).astype(int)
+    blocks = [slice(a, b) for a, b in zip(edges[:-1], edges[1:])]
+    pick = lambda a, b: a[b] if isinstance(a, np.ndarray) and a.ndim and a.shape[0] == n else a
+    with ThreadPoolExecutor(nt) as ex:
+        res = list(ex.map(lambda b: fn(*[pick(a, b) for a in args]), blocks))
+    if isinstance(res[0], tuple):
+        return tuple(np.concatenate(parts, axis=0) for parts in zip(*res))
+    return np.concatenate(res, axis=0)
 
 
 # --------------------------------------------------------------------------- deviance
@@ -24,25 +75,29 @@ def unit_nb_deviance(y, mu, phi):
     y = np.asarray(y, dtype=float) + 1e-8
     mu = np.asarray(mu, dtype=float) + 1e-8
     y, mu, phi = np.broadcast_arrays(y, mu, np.asarray(phi, dtype=float))
-    out = np.empty(y.shape)
-    pois = phi < 1e-4
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        r = y[pois] - mu[pois]
-        p = phi[pois]
-        # nbdev.c writes 2/3*resid, which is C integer division (== 0); reproduced as such.
-        out[pois] = 2 * (y[pois] * np.log(y[pois] / mu[pois]) - r - 0.5 * r * r * p * (1 + p * (0.0 * r - y[pois])))
-        rest = ~pois
-        prod = mu * phi
-        gam = rest & (prod > 1e6)
-        out[gam] = 2 * ((y[gam] - mu[gam]) / mu[gam] - np.log(y[gam] / mu[gam])) * mu[gam] / (1 + prod[gam])
-        nb = rest & ~(prod > 1e6)
-        inv = 1.0 / phi[nb]
-        out[nb] = 2 * (y[nb] * np.log(y[nb] / mu[nb]) + (y[nb] + inv) * np.log((mu[nb] + inv) / (y[nb] + inv)))
-    return np.maximum(out, 0.0)                 # edgeR >= 4.4 floors unit deviances at 0
+        inv = 1.0 / phi
+        out = 2 * (y * np.log(y / mu) + (y + inv) * np.log((mu + inv) / (y + inv)))     # NB
+        pois = phi < 1e-4
+        if pois.any():
+            yp, mp, pp = y[pois], mu[pois], phi[pois]
+            r = yp - mp
+            # nbdev.c writes 2/3*resid, which is C integer division (== 0); reproduced as such.
+            out[pois] = 2 * (yp * np.log(yp / mp) - r - 0.5 * r * r * pp * (1 + pp * (0.0 * r - yp)))
+        gam = ~pois & (mu * phi > 1e6)
+        if gam.any():
+            yg, mg = y[gam], mu[gam]
+            out[gam] = 2 * ((yg - mg) / mg - np.log(yg / mg)) * mg / (1 + mg * phi[gam])
+    return np.maximum(out, 0.0, out=out)        # edgeR >= 4.4 floors unit deviances at 0
 
 
 def nb_deviance(Y, Mu, Phi, W):
-    return (W * unit_nb_deviance(Y, Mu, Phi)).sum(axis=1)
+    Y = np.asarray(Y, dtype=float)
+    if Y.ndim != 2:
+        return (W * unit_nb_deviance(Y, Mu, Phi)).sum(axis=1)
+    sh = Y.shape
+    return row_parallel(lambda y, m, p, w: (w * unit_nb_deviance(y, m, p)).sum(axis=1), sh[0],
+                        Y, _full(Mu, sh), _full(Phi, sh), _full(W, sh))
 
 
 # --------------------------------------------------------------------------- linear algebra helpers
@@ -141,24 +196,216 @@ def mglm_one_group(Y, Off, Phi, W, start=None, maxit=50, tol=1e-10):
     return beta
 
 
-def mglm_one_way(Y, X, Off, Phi, W, start=None, maxit=50, tol=1e-10):
+def _mglm_one_group_np(Y, Off, Phi, W, start=None, maxit=50, tol=1e-10):
+    """glm_one_group.cpp vectorised over genes; converged genes leave the active set.
+
+    mu = exp(beta) * exp(offset): exp(offset) is computed once instead of
+    exp(beta + offset) per observation and iteration (equal up to rounding).
+    """
+    N = np.exp(Off)
+    nonzero = (Y > LOW_VALUE).any(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        beta = np.log(np.where(Y > LOW_VALUE, Y / N * W, 0.0).sum(axis=1) / W.sum(axis=1))
+    if start is not None:                       # C code recomputes the start where it is NA
+        start = np.asarray(start, dtype=float)
+        beta = np.where(np.isnan(start), beta, start)
+    act = np.flatnonzero(nonzero)
+    y, n_, p, w = Y[act], N[act], Phi[act], W[act]
+    with np.errstate(over="ignore", invalid="ignore"):
+        for _ in range(maxit):
+            if not act.size:
+                break
+            mu = np.exp(beta[act])[:, None] * n_
+            den = 1 + mu * p
+            step = ((y - mu) / den * w).sum(axis=1) / (mu / den * w).sum(axis=1)
+            beta[act] += step
+            moving = ~(np.abs(step) < tol)
+            if not moving.all():
+                act = act[moving]
+                y, n_, p, w = y[moving], n_[moving], p[moving], w[moving]
+    beta[~nonzero] = -np.inf
+    return beta
+
+
+def _one_way_layout(X):
     codes, ng = design_as_factor(X)
     first = np.array([np.flatnonzero(codes == g)[0] for g in range(ng)])
     du = X[first]
     indicator = (du == 1).sum() == ng and (du == 0).sum() == (ng - 1) * ng
-    gstart = None
-    if start is not None:
-        gstart = np.asarray(start, dtype=float) @ du.T
-    beta = np.zeros((Y.shape[0], ng))
-    for g in range(ng):
-        j = codes == g
-        beta[:, g] = mglm_one_group(Y[:, j], Off[:, j], Phi[:, j], W[:, j],
-                                    start=None if gstart is None else gstart[:, g], maxit=maxit, tol=tol)
+    return codes, ng, du, indicator
+
+
+def _fit_one_way_block(Y, Off, Phi, W, gstart, codes, ng, maxit, tol, deviance=True):
+    beta = np.column_stack([
+        _mglm_one_group_np(Y[:, codes == g], Off[:, codes == g], Phi[:, codes == g], W[:, codes == g],
+                           start=None if gstart is None else gstart[:, g], maxit=maxit, tol=tol)
+        for g in range(ng)])
     beta = np.maximum(beta, -1e8)
     mu = np.exp(beta[:, codes] + Off)
+    dev = (W * unit_nb_deviance(Y, mu, Phi)).sum(axis=1) if deviance else np.full(len(Y), np.nan)
+    return beta, mu, dev
+
+
+def fit_one_way(Y, X, Off, Phi, W, start=None, maxit=50, tol=1e-10, deviance=True):
+    """mglmOneWay followed by the NB deviance: returns beta, mu, deviance (row blocks in parallel).
+
+    ``deviance=False`` skips the deviance (NaN), for callers that only need the fit.
+    """
+    Y = np.asarray(Y, dtype=float)
+    sh = Y.shape
+    phi_row = _row_constant(Phi, sh)
+    if phi_row is not None and _all_ones(W):
+        # one dispersion per gene and unit weights (glmFit, glmQLFit, the dispersion grid):
+        # broadcast the dispersion instead of materialising (genes x samples) matrices
+        beta, mu, _ = OneWayFitter(Y, X, Off).fit(phi_row, start=start, maxit=maxit, tol=tol)
+        if not deviance:
+            return beta, mu, np.full(sh[0], np.nan)
+        dev = block_map(lambda sl: unit_nb_deviance(Y[sl], mu[sl], phi_row[sl, None]).sum(axis=1), sh[0])
+        return beta, mu, dev
+    codes, ng, du, indicator = _one_way_layout(X)
+    gstart = None if start is None else np.asarray(start, dtype=float) @ du.T
+    beta, mu, dev = row_parallel(
+        lambda y, o, p, w, gs: _fit_one_way_block(y, o, p, w, gs, codes, ng, maxit, tol, deviance),
+        sh[0], Y, _full(Off, sh), _full(Phi, sh), _full(W, sh), gstart)
     if not indicator:
         beta = np.linalg.solve(du, beta.T).T
+    return beta, mu, dev
+
+
+class OneWayFitter:
+    """mglmOneWay prepared once for repeated fits of the same counts at different dispersions.
+
+    The dispersion grid of estimateDisp refits the same genes 21 times with a single
+    dispersion value per fit. Group sub-matrices and exp(offset) are built once here;
+    each fit then only broadcasts the dispersion. Unit weights are assumed.
+    """
+
+    def __init__(self, Y, X, Off):
+        codes, ng, du, indicator = _one_way_layout(np.asarray(X, dtype=float))
+        Y = np.asarray(Y, dtype=float)
+        Off = np.broadcast_to(np.asarray(Off, dtype=float), Y.shape)
+        self.codes, self.ng, self.du, self.indicator = codes, ng, du, indicator
+        self.Off = Off
+        self.cols = [np.flatnonzero(codes == g) for g in range(ng)]
+        self.Yg = [np.ascontiguousarray(Y[:, c]) for c in self.cols]
+        self.Ng = [np.exp(Off[:, c]) for c in self.cols]
+        self.n = Y.shape[0]
+
+    def fit(self, phi, start=None, maxit=50, tol=1e-10):
+        """phi: scalar or one value per gene. Returns beta (group coefficients), mu, log(mu)."""
+        phi = np.asarray(phi, dtype=float)
+        phi_col = phi.reshape(-1, 1) if phi.ndim else phi
+        gstart = None if start is None else np.asarray(start, dtype=float) @ self.du.T
+
+        def block(sl):
+            pc = phi_col[sl] if phi_col.ndim else phi_col
+            beta = np.column_stack([
+                _one_group_newton(self.Yg[g][sl], self.Ng[g][sl], pc, None,
+                                  None if gstart is None else gstart[sl, g], maxit, tol)
+                for g in range(self.ng)])
+            beta = np.maximum(beta, -1e8)
+            log_mu = beta[:, self.codes] + self.Off[sl]
+            return beta, np.exp(log_mu), log_mu
+
+        beta, mu, log_mu = block_map(block, self.n)
+        if not self.indicator:
+            beta = np.linalg.solve(self.du, beta.T).T
+        return beta, mu, log_mu
+
+
+def _one_group_newton(Y, N, phi, W, start, maxit, tol):
+    """glm_one_group.cpp vectorised over genes: Y, N = exp(offset) (n, s); phi (n, 1), (n, s) or scalar; W None = unit."""
+    nonzero = (Y > LOW_VALUE).any(axis=1)
+    wsum = Y.shape[1] if W is None else W.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        q = np.where(Y > LOW_VALUE, Y / N, 0.0) if W is None else np.where(Y > LOW_VALUE, Y / N * W, 0.0)
+        beta = np.log(q.sum(axis=1) / wsum)
+    if start is not None:                       # C code recomputes the start where it is NA
+        beta = np.where(np.isnan(start), beta, start)
+    act = np.flatnonzero(nonzero)
+    y, n_ = Y[act], N[act]
+    p = phi[act] if np.ndim(phi) == 2 else phi
+    w = None if W is None else W[act]
+    with np.errstate(over="ignore", invalid="ignore"):
+        for _ in range(maxit):
+            if not act.size:
+                break
+            mu = np.exp(beta[act])[:, None] * n_
+            r = mu * p                                   # r = w / (1 + mu * phi), built in place
+            r += 1.0
+            np.reciprocal(r, out=r)
+            if w is not None:
+                r *= w
+            info = np.einsum("ij,ij->i", mu, r)          # sum(mu * r) without a temporary
+            step = (np.einsum("ij,ij->i", y, r) - info) / info
+            beta[act] += step
+            moving = ~(np.abs(step) < tol)
+            if not moving.all():
+                act = act[moving]
+                y, n_ = y[moving], n_[moving]
+                if np.ndim(p) == 2:
+                    p = p[moving]
+                if w is not None:
+                    w = w[moving]
+    beta[~nonzero] = -np.inf
+    return beta
+
+
+def compute_apl_one_disp(Y, mu, log_mu, phi, X, lgamma_y1):
+    """R_compute_apl.cpp for unit weights and one dispersion per gene (scalar or (n,)).
+
+    log(mu) is taken from the fit, and the dispersion-only terms r log r - lgamma(r)
+    are evaluated once per gene instead of once per observation.
+    """
+    phi = np.asarray(phi, dtype=float)
+    X = np.asarray(X, dtype=float)
+
+    def block(sl):
+        y, m, lm, lg = Y[sl], mu[sl], log_mu[sl], lgamma_y1[sl]
+        ph = phi[sl].reshape(-1, 1) if phi.ndim else phi
+        if not np.all(ph > 0):
+            return _compute_apl_np(y, m, np.broadcast_to(ph, y.shape), np.ones_like(y), X, True, lg)
+        rr = 1.0 / ph
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ll = y * lm - (y + rr) * np.log(m + rr) + special.gammaln(y + rr) - lg
+            const = rr * np.log(rr) - special.gammaln(rr)
+        pos = m != 0
+        if pos.all():
+            out = ll.sum(1) + (const * y.shape[1] if np.ndim(const) == 0 else const[:, 0] * y.shape[1])
+        else:
+            out = np.where(pos, ll + const, 0.0).sum(1)
+        ww = m / (1 + ph * m)
+        if not pos.all():
+            ww = np.where(pos, ww, 0.0)
+        if X.shape[1] == 1:
+            adj = np.log(np.abs(ww.sum(1))) / 2
+        else:
+            adj = ldl_logdet_floor(_xtwx(X, ww)) * 0.5
+        return out - adj
+
+    return block_map(block, Y.shape[0])
+
+
+def mglm_one_way(Y, X, Off, Phi, W, start=None, maxit=50, tol=1e-10):
+    beta, mu, _ = fit_one_way(Y, X, Off, Phi, W, start=start, maxit=maxit, tol=tol)
     return beta, mu
+
+
+def _row_constant(A, shape):
+    """The per-row value if ``A`` (broadcastable to ``shape``) is constant along rows, else None."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim == 0:
+        return np.full(shape[0], float(A))
+    if A.ndim == 1:
+        return A if A.shape[0] == shape[0] else None
+    if A.shape[1] == 1:
+        return A[:, 0]
+    return A[:, 0].copy() if (A == A[:, :1]).all() else None
+
+
+def _all_ones(W):
+    W = np.asarray(W)
+    return bool((W == 1).all())
 
 
 def is_one_way(X):
@@ -323,31 +570,47 @@ def resid_df(zero, X):
 
 
 # --------------------------------------------------------------------------- adjusted profile likelihood
-def compute_apl(Y, Mu, Phi, W, X, adjust=True):
-    """R_compute_apl.cpp."""
-    from . import _numba_kernels as nk
-    if nk.HAVE_NUMBA:
-        Y = np.ascontiguousarray(Y, dtype=float)
-        return nk.compute_apl_nb(Y, _full(Mu, Y.shape), _full(Phi, Y.shape), _full(W, Y.shape),
-                                 np.ascontiguousarray(X, dtype=float), bool(adjust))
-    return _compute_apl_np(Y, Mu, Phi, W, X, adjust)
+def compute_apl(Y, Mu, Phi, W, X, adjust=True, lgamma_y1=None):
+    """R_compute_apl.cpp, vectorised; row blocks run in parallel.
 
-
-def _compute_apl_np(Y, Mu, Phi, W, X, adjust=True):
-    """R_compute_apl.cpp (vectorised NumPy fallback)."""
+    ``lgamma_y1`` = lgamma(Y * W + 1) does not depend on the dispersion and may be
+    passed in to reuse it across the dispersion grid.
+    """
     Y = np.asarray(Y, dtype=float)
+    sh = Y.shape
+    X = np.asarray(X, dtype=float)
+    return row_parallel(lambda y, m, p, w, lg: _compute_apl_np(y, m, p, w, X, adjust, lg),
+                        sh[0], Y, _full(Mu, sh), _full(Phi, sh), _full(W, sh),
+                        None if lgamma_y1 is None else np.asarray(lgamma_y1, dtype=float))
+
+
+def _compute_apl_np(Y, Mu, Phi, W, X, adjust=True, lgamma_y1=None):
+    """R_compute_apl.cpp (vectorised)."""
     pos = Mu != 0
     w = W
     cmu = Mu * w
     cy = Y * w
     cd = Phi / w
+    lgy1 = special.gammaln(cy + 1) if lgamma_y1 is None else lgamma_y1
     with np.errstate(divide="ignore", invalid="ignore"):
-        rr = 1.0 / cd
+        if cd.size and (cd == cd[:, :1]).all():          # one dispersion per gene: per-row terms
+            rr_row = 1.0 / cd[:, :1]
+            rr = np.broadcast_to(rr_row, cd.shape)
+            rr_log_rr = rr_row * np.log(rr_row)
+            lg_rr = special.gammaln(rr_row)
+        else:
+            rr = 1.0 / cd
+            rr_log_rr = rr * np.log(rr)
+            lg_rr = special.gammaln(rr)
+        log_cmu = np.log(cmu)
         logmur = np.log(cmu + rr)
-        nb = (cy * np.log(cmu) - cy * logmur + rr * np.log(rr) - rr * logmur
-              + special.gammaln(cy + rr) - special.gammaln(cy + 1) - special.gammaln(rr))
-        po = cy * np.log(cmu) - cmu - special.gammaln(cy + 1)
-    ll = np.where(cd > 0, nb, po) + np.log(w)
+        nb = (cy * log_cmu - cy * logmur + rr_log_rr - rr * logmur + special.gammaln(cy + rr) - lgy1 - lg_rr)
+        if (cd > 0).all():
+            ll = nb
+        else:
+            ll = np.where(cd > 0, nb, cy * log_cmu - cmu - lgy1)
+    if not (w == 1).all():
+        ll = ll + np.log(w)
     out = np.where(pos, ll, 0.0).sum(1)
     if adjust:
         ww = np.where(pos, cmu / (1 + cd * cmu), 0.0)

@@ -235,3 +235,61 @@ def test_glm_treat(setup, k):
     rtol, atol = (RTOL_COXREID, 1e-5) if k == 3 else (RTOL, 1e-7)
     _close(tab["logFC"], r["logFC"], rtol=rtol, atol=atol)
     _close(tab["PValue"], r["PValue"], rtol=rtol, atol=1e-12)
+
+
+# ---------------------------------------------------------------- 0.2.3 regressions
+def test_q2qnbinom_extreme_tails():
+    """pgamma/qgamma in log space: no infinite pseudo-counts where the tail probability underflows."""
+    q = _read("q2q_extreme.tsv")
+    with np.errstate(all="raise"):
+        out = pyedger.core.q2qnbinom(q["x"].to_numpy(float)[:, None], q["input"].to_numpy()[:, None],
+                                     q["output"].to_numpy()[:, None], q["disp"].to_numpy())[:, 0]
+    assert np.isfinite(out).all()
+    _close(out, q["q2q"], rtol=1e-8)
+
+
+@pytest.mark.parametrize("case", ["extreme", "negpseudo"])
+def test_exact_test_extreme_tcga_genes(case):
+    """TCGA genes whose exactTest P was wrong in pyedger <= 0.2.2.
+
+    extreme: TCGA-BRCA, pseudo-counts overflowed and P came out as 1 instead of ~0.
+    negpseudo: TCGA-COAD, negative pseudo-counts made the tail sum empty and P came out as 0.
+    """
+    ex = pd.read_csv(DATA / f"exact_{case}_counts.tsv.gz", sep="\t", index_col=0)
+    disp = _read(f"exact_{case}_disp.tsv")
+    ref = _read(f"exact_{case}_ref.tsv")
+    y = pyedger.DGEList(ex[disp["gene"]].T, lib_size=ex["lib_size"], norm_factors=ex["norm_factor"],
+                        group=pd.Categorical(ex["group"], ["Normal", "Tumor"]))
+    et = pyedger.exactTest(y, dispersion=disp["dispersion"].to_numpy())       # numeric vector, as in R
+    _close(et.table["logFC"], ref["logFC"], rtol=1e-10)
+    p, pr = et.table["PValue"].to_numpy(), ref["PValue"].to_numpy()
+    # where R's dnbinom underflows to exactly 0, SciPy may return a subnormal value
+    assert (p[pr == 0] < 1e-250).all()
+    _close(p[pr > 0], pr[pr > 0], rtol=1e-6)
+
+
+def test_tmmwsp():
+    X = pd.read_csv(DATA / "counts.tsv", sep="\t", index_col=0)
+    _close(pyedger.calcNormFactors(X, method="TMMwsp"), _read("tmmwsp.tsv")["norm"], rtol=1e-12)
+    p = _read("tmm_ties.tsv.gz")
+    obs, ref = np.repeat(p["obs"].to_numpy(float), p["n"]), np.repeat(p["ref"].to_numpy(float), p["n"])
+    f = pyedger.core._calc_factor_tmmwsp(obs, ref, obs.sum(), ref.sum())
+    _close(f, _read("tmmwsp_ties_ref.tsv")["factor"][0], rtol=1e-12)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_estimate_disp_one_way_design(setup, k):
+    """One-way designs take the prepared one-way fitter in the dispersion grid."""
+    X, cond, D = setup
+    lib = pd.Categorical(X.columns.str.replace(r"_(KO|NT)$", "", regex=True))
+    if k == 1:
+        Dk = np.column_stack([np.ones(len(cond)), np.asarray(cond) == "KO"]).astype(float)
+    else:
+        Dk = pd.get_dummies(lib).to_numpy(float)
+    y = pyedger.estimateDisp(_dge(X, cond), Dk)
+    s = _read(f"oneway{k}_disp_scalar.tsv")
+    _close(y.common_dispersion, s["common"][0], rtol=RTOL_COXREID)
+    _close(y.prior_df, s["prior_df"][0], rtol=RTOL_COXREID)
+    d = _read(f"oneway{k}_disp.tsv")
+    _close(y.trended_dispersion, d["trended"], rtol=RTOL_COXREID)
+    _close(y.tagwise_dispersion, d["tagwise"], rtol=RTOL_COXREID)

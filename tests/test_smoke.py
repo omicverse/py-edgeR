@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import pyedger
@@ -71,3 +72,54 @@ def test_rstyle_aliases_exist():
                "glmLRT", "glmQLFit", "glmQLFTest", "exactTest", "topTags",
                "filterByExpr", "cpm"):
         assert hasattr(pyedger, nm), nm
+
+
+def test_dgelist_subset_like_r():
+    rng = np.random.default_rng(1)
+    X = pd.DataFrame(rng.poisson(20, (50, 6)), index=[f"g{i}" for i in range(50)], columns=list("abcdef"))
+    y = pyedger.DGEList(X, group=pd.Categorical(list("xxxyyy")))
+    keep = pyedger.filterByExpr(y)
+    kept = y[keep]                                             # R default: keep.lib.sizes = TRUE
+    np.testing.assert_array_equal(kept.samples["lib.size"], y.samples["lib.size"])
+    assert kept.counts.shape == (int(np.sum(keep)), 6)
+    re = y.subset(keep, keep_lib_sizes=False)                  # y[keep, , keep.lib.sizes = FALSE]
+    np.testing.assert_array_equal(re.samples["lib.size"], X.loc[np.asarray(keep)].sum(0).to_numpy(float))
+    two = y[["g1", "g3"], ["a", "d"]]
+    assert two.counts.shape == (2, 2) and list(two.samples["group"].cat.categories) == ["x", "y"]
+
+
+def test_estimate_disp_positional_design_matches_keyword():
+    rng = np.random.default_rng(2)
+    X = pd.DataFrame(rng.negative_binomial(5, 0.2, (200, 6)))
+    group = np.array(["a"] * 3 + ["b"] * 3)
+    design = np.column_stack([np.ones(6), (group == "b").astype(float)])
+    a = pyedger.estimateDisp(pyedger.calcNormFactors(pyedger.DGEList(X, group=group)), design)
+    b = pyedger.estimateDisp(pyedger.calcNormFactors(pyedger.DGEList(X, group=group)), design=design)
+    np.testing.assert_array_equal(a.tagwise_dispersion, b.tagwise_dispersion)
+    with pytest.warns(FutureWarning):
+        pyedger.estimateDisp(pyedger.calcNormFactors(pyedger.DGEList(X, group=group)), group)
+
+
+def test_version():
+    assert isinstance(pyedger.__version__, str) and pyedger.__version__
+
+
+def test_threads_do_not_change_results(monkeypatch):
+    """Row blocks are independent, so the thread count must not change any result bit."""
+    rng = np.random.default_rng(3)
+    X = pd.DataFrame(rng.negative_binomial(3, 0.05, (5000, 8)))
+    group = pd.Categorical(["a"] * 4 + ["b"] * 4)
+    design = np.column_stack([np.ones(8), np.asarray(group) == "b"]).astype(float)
+
+    def run():
+        y = pyedger.estimateDisp(pyedger.normLibSizes(pyedger.DGEList(X, group=group)), design)
+        q = pyedger.glmQLFTest(pyedger.glmQLFit(y, design), coef=1).table
+        e = pyedger.exactTest(y).table
+        return y.tagwise_dispersion, q["PValue"].to_numpy(), e["PValue"].to_numpy()
+
+    monkeypatch.setenv("PYEDGER_NUM_THREADS", "1")
+    one = run()
+    monkeypatch.setenv("PYEDGER_NUM_THREADS", "4")
+    four = run()
+    for a, b in zip(one, four):
+        np.testing.assert_array_equal(a, b)

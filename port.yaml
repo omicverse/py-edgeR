@@ -11,24 +11,24 @@ domain: bulk   # single-cell | spatial | trajectory | bulk | proteomics | metabo
 upstream:
   name: "edgeR"
   source: "Bioconductor"   # CRAN | Bioconductor | GitHub | other
-  version: null   # TODO: upstream version the parity test was run against
+  version: "4.10.5"
   url: "https://bioconductor.org/packages/edgeR"
-  license: null   # TODO: upstream R package license (GPL-3, MIT, Artistic-2.0, …)
+  license: "GPL (>=2)"
   citation: "Robinson, M.D., McCarthy, D.J., Smyth, G.K. edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. Bioinformatics 26(1), 139–140 (2010)."
 omicverse:
-  module: null   # TODO: e.g. ov.single.pyDoubletFinder, or leave null
+  module: "ov.bulk.pyDEG (method='edger' / 'edgepy'), ov.single Milo"
   since: null
 parity:
-  status: unverified   # pass | partial | unverified
-  algorithm_class: null   # TODO: see omicverse-rebuildr/PARITY_TAXONOMY.md
-  metric: null   # TODO: pearson | spearman | ari | jaccard | max_abs_diff | …
-  threshold: null
-  value: null   # TODO: measured value on the canonical fixture
-  fixture: null
-  test: null
+  status: pass   # pass | partial | unverified
+  algorithm_class: statistical-inference
+  metric: "DE-call agreement (FDR<=0.05, |log2FC|>=1) and max relative P-value difference"
+  threshold: "identical DE calls; P rel. diff <= 1e-4"
+  value: "0 discordant calls in 3 tests x 68 analyses; max rel. P diff 1.2e-5 (QL), 3.8e-7 (LRT), 5.1e-8 (exact)"
+  fixture: "TCGA tumour vs normal: BRCA, COAD, KIRC, LIHC, LUAD, LUSC, PRAD, THCA (421-1,208 samples) + 60 LUAD small-sample draws"
+  test: "tests/test_r_parity.py"
 artifacts:
   audit: null
-  report: null
+  report: "https://omicverse.org/articles/pyedger.html"   # benchmark: report/
   compare_notebook: null
   function_notebook: null
 functions:
@@ -87,32 +87,16 @@ functions:
     py: "decide_tests_dge"
     aliases: ["decideTests"]
     status: ported
-  - r: "the corresponding S4 classes"
+  - r: "DGEGLM / DGELRT / DGEExact / TestResults (S4 classes)"
     py: "DGEGLM / DGELRT / DGEExact / TestResults"
     status: ported
     parity: exact
-  - r: "~1e-9"
-    py: "glmFit"
+  - r: "estimateGLMCommonDisp / estimateGLMTrendedDisp / estimateGLMTagwiseDisp"
+    py: "estimate_glm_common_disp / estimate_glm_trended_disp / estimate_glm_tagwise_disp"
     status: ported
-    parity: approx
-  - r: "~1e-10"
-    py: "estimateDisp"
+  - r: "estimateGLMRobustDisp"
+    py: "estimate_glm_robust_disp"
     status: ported
-    parity: approx
-  - r: "bit-identical"
-    py: "locfitByCol"
+  - r: "equalizeLibSizes / q2qnbinom"
+    py: "equalize_lib_sizes / core.q2qnbinom"
     status: ported
-    parity: exact
-  - r: "~1e-11"
-    py: "squeezeVar"
-    aliases: ["fitFDist", "fitFDistUnequalDF1", "fitFDistRobustly"]
-    status: ported
-    parity: approx
-  - r: "~1e-9"
-    py: "glmQLFit"
-    status: ported
-    parity: approx
-  - r: "~1e-10"
-    py: "glmQLFit / exactTest / glmTreat"
-    status: ported
-    parity: exact
