@@ -16,12 +16,14 @@ from .core import (
     estimate_common_disp,
     estimate_disp,
     estimate_glm_common_disp,
+    estimate_glm_robust_disp,
     estimate_glm_tagwise_disp,
     estimate_glm_trended_disp,
     estimate_tagwise_disp,
     exact_test,
     filter_by_expr,
     glm_fit,
+    glm_residuals,
     glm_lrt,
     glm_ql_fit,
     glm_qlf_test,
@@ -38,6 +40,8 @@ estimateCommonDisp = estimate_common_disp
 estimateTagwiseDisp = estimate_tagwise_disp
 estimateDisp = estimate_disp
 estimateGLMCommonDisp = estimate_glm_common_disp
+estimateGLMRobustDisp = estimate_glm_robust_disp
+glmResiduals = glm_residuals
 estimateGLMTagwiseDisp = estimate_glm_tagwise_disp
 estimateGLMTrendedDisp = estimate_glm_trended_disp
 exactTest = exact_test
@@ -55,6 +59,10 @@ topTags = top_tags
 aveLogCPM = ave_log_cpm
 
 __all__ = [
+    "estimate_glm_robust_disp",
+    "estimateGLMRobustDisp",
+    "glm_residuals",
+    "glmResiduals",
     "DGEExact",
     "DGEGLM",
     "DGELRT",
