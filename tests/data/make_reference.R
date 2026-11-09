@@ -111,3 +111,43 @@ for (k in 1:3) {
   tr <- glmTreat(f, coef = ncol(D), lfc = log2(1.5))
   w(data.frame(logFC = tr$table$logFC, PValue = tr$table$PValue), sprintf("treat%d.tsv", k))
 }
+
+# 8) q2qnbinom in the far tails (pgamma/qgamma with log.p): the inputs reach probabilities
+#    far below the double range, which pyedger <= 0.2.2 turned into infinite pseudo-counts.
+set.seed(20261109); nq <- 2000
+qx <- round(10^runif(nq, 0, 5)); qim <- 10^runif(nq, -1, 4)
+qom <- qim * 10^runif(nq, -1.5, 1.5); qd <- 10^runif(nq, -2, 0.7)
+w(data.frame(x = qx, input = sprintf("%.17g", qim), output = sprintf("%.17g", qom), disp = sprintf("%.17g", qd),
+             q2q = sprintf("%.17g", q2qnbinom(qx, qim, qom, qd))), "q2q_extreme.tsv")
+
+# 9) exactTest on the nine TCGA-BRCA genes (1,095 tumours vs 113 normals) whose pseudo-counts overflowed
+#    in pyedger <= 0.2.2, with edgeR's tagwise dispersions passed as a numeric vector.
+ex <- read.delim(gzfile(file.path(d, "exact_extreme_counts.tsv.gz")), row.names = 1, check.names = FALSE)
+exd <- read.delim(file.path(d, "exact_extreme_disp.tsv"))
+yx <- DGEList(t(as.matrix(ex[, exd$gene])), lib.size = ex$lib_size, norm.factors = ex$norm_factor,
+              group = factor(ex$group, levels = c("Normal", "Tumor")))
+etx <- exactTest(yx, dispersion = exd$dispersion)
+w(data.frame(gene = exd$gene, logFC = sprintf("%.17g", etx$table$logFC), PValue = sprintf("%.17g", etx$table$PValue)),
+  "exact_extreme_ref.tsv")
+
+# 9b) the same for five TCGA-COAD genes with negative pseudo-counts in one group (R's s1:s runs downwards)
+ex <- read.delim(gzfile(file.path(d, "exact_negpseudo_counts.tsv.gz")), row.names = 1, check.names = FALSE)
+exd <- read.delim(file.path(d, "exact_negpseudo_disp.tsv"))
+yx <- DGEList(t(as.matrix(ex[, exd$gene])), lib.size = ex$lib_size, norm.factors = ex$norm_factor,
+              group = factor(ex$group, levels = c("Normal", "Tumor")))
+etx <- exactTest(yx, dispersion = exd$dispersion)
+w(data.frame(gene = exd$gene, logFC = sprintf("%.17g", etx$table$logFC), PValue = sprintf("%.17g", etx$table$PValue)),
+  "exact_negpseudo_ref.tsv")
+
+# 10) TMMwsp normalisation factors (counts.tsv) and the TMMwsp factor of the tied-log-ratio pair
+w(data.frame(norm = sprintf("%.17g", normLibSizes(X, method = "TMMwsp"))), "tmmwsp.tsv")
+pt <- read.delim(file.path(d, "tmm_ties.tsv.gz"))
+w(data.frame(factor = sprintf("%.17g", edgeR:::.calcFactorTMMwsp(rep(pt$obs, pt$n), rep(pt$ref, pt$n)))), "tmmwsp_ties_ref.tsv")
+
+# 11) estimateDisp + glmQLFit with one-way designs (two groups ~cond; six groups ~0+lib)
+for (k in 1:2) {
+  Dk <- if (k == 1) model.matrix(~cond) else model.matrix(~0 + lib)
+  yk <- estimateDisp(y, Dk)
+  w(data.frame(common = yk$common.dispersion, prior_df = yk$prior.df), sprintf("oneway%d_disp_scalar.tsv", k))
+  w(data.frame(trended = yk$trended.dispersion, tagwise = yk$tagwise.dispersion), sprintf("oneway%d_disp.tsv", k))
+}

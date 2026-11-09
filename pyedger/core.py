@@ -94,6 +94,70 @@ class DGEList:
         self.pseudo_counts = None
         self.pseudo_lib_size = None
 
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.counts.shape
+
+    def __getitem__(self, key) -> "DGEList":
+        """``y[i]`` / ``y[i, j]`` as edgeR's ``y[i, j]`` (lib sizes kept; see :meth:`subset`)."""
+        if isinstance(key, tuple):
+            if len(key) != 2:
+                raise IndexError("DGEList takes one (genes) or two (genes, samples) subscripts.")
+            return self.subset(*key)
+        return self.subset(key)
+
+    def subset(self, i=None, j=None, keep_lib_sizes: bool = True) -> "DGEList":
+        """edgeR ``[.DGEList``: genes ``i``, samples ``j`` (boolean mask, positions or labels).
+
+        As in R, ``keep_lib_sizes=True`` keeps the original library sizes;
+        ``keep_lib_sizes=False`` recomputes them from the retained genes, which is
+        what ``y[keep, , keep.lib.sizes = FALSE]`` after ``filterByExpr`` does.
+        """
+        import copy
+        out = copy.copy(self)
+        ri = slice(None) if _is_all(i) else _positions(i, self.counts.index, "genes")
+        ci = slice(None) if _is_all(j) else _positions(j, self.counts.columns, "samples")
+        out.counts = self.counts.iloc[ri, ci]
+        for name in ("pseudo_counts", "weights"):
+            v = getattr(self, name)
+            if v is not None:
+                setattr(out, name, v.iloc[ri, ci] if isinstance(v, pd.DataFrame) else np.asarray(v)[ri][:, ci])
+        if self.genes is not None:
+            out.genes = self.genes.iloc[ri]
+        out.samples = self.samples.iloc[ci].copy()
+        n = self.counts.shape[0]
+        for name in ("AveLogCPM", "trended_dispersion", "tagwise_dispersion", "prior_n", "prior_df"):
+            v = getattr(self, name)
+            if v is not None and np.ndim(v) == 1 and len(v) == n and n > 1:
+                setattr(out, name, np.asarray(v)[ri])
+        if not _is_all(i) and not keep_lib_sizes:
+            out.samples["lib.size"] = out.counts.sum(axis=0).to_numpy(dtype=float)
+        if not _is_all(j) and "group" in out.samples.columns and isinstance(out.samples["group"].dtype, pd.CategoricalDtype):
+            out.samples["group"] = out.samples["group"].cat.remove_unused_categories()
+        return out
+
+
+def _is_all(idx) -> bool:
+    return idx is None or (isinstance(idx, slice) and idx == slice(None))
+
+
+def _positions(idx, labels: pd.Index, what: str) -> np.ndarray:
+    if isinstance(idx, slice):
+        return np.arange(len(labels))[idx]
+    if isinstance(idx, pd.Series) and idx.dtype == bool:
+        idx = idx.reindex(labels).to_numpy() if idx.index.equals(labels) or set(idx.index) == set(labels) else idx.to_numpy()
+    arr = np.asarray(idx)
+    if arr.dtype == bool:
+        if arr.size != len(labels):
+            raise IndexError(f"boolean subscript has length {arr.size}, expected {len(labels)} {what}.")
+        return np.flatnonzero(arr)
+    if arr.dtype.kind in "iu":
+        return arr
+    pos = labels.get_indexer(arr)
+    if (pos < 0).any():
+        raise KeyError(f"Subscript not found in {what}.")
+    return pos
+
 
 @dataclass
 class DGEExact:
@@ -207,6 +271,13 @@ def calc_norm_factors(
         f = _calc_factor_rle(x) / lib
     elif method == "UPPERQUARTILE":
         f = _calc_factor_quantile(x, lib, p=p)
+    elif method == "TMMwsp":
+        if ref_column is None:
+            ref_column = int(np.argmax(np.sum(np.sqrt(x), axis=0)))
+        f = np.array([
+            _calc_factor_tmmwsp(x[:, i], x[:, ref_column], lib[i], lib[ref_column], logratio_trim, sum_trim, do_weighting)
+            for i in range(nsamples)
+        ])
     elif method == "TMM":
         if ref_column is None:
             f75 = _calc_factor_quantile(x, lib, p=0.75)
@@ -225,7 +296,7 @@ def calc_norm_factors(
             for i in range(nsamples)
         ])
     else:
-        raise ValueError("method must be one of TMM, RLE, upperquartile, none.")
+        raise ValueError("method must be one of TMM, TMMwsp, RLE, upperquartile, none.")
 
     with np.errstate(divide="ignore", invalid="ignore"):
         f = f / np.exp(np.mean(np.log(f)))
@@ -302,6 +373,63 @@ def _calc_factor_tmm(
     if not np.isfinite(f):
         f = 0.0
     return float(2.0 ** f)
+
+
+def _calc_factor_tmmwsp(obs, ref, libsize_obs, libsize_ref, logratio_trim=0.3, sum_trim=0.05, do_weighting=True) -> float:
+    """edgeR .calcFactorTMMwsp: TMM with singleton pairing for data with many zeros."""
+    obs = np.asarray(obs, dtype=float)
+    ref = np.asarray(ref, dtype=float)
+    eps = 1e-14
+    npos = 2 * (obs > eps).astype(int) + (ref > eps).astype(int)
+    keep0 = npos != 0
+    obs, ref, npos = obs[keep0], ref[keep0], npos[keep0]
+    if libsize_obs is None:
+        libsize_obs = obs.sum()
+    if libsize_ref is None:
+        libsize_ref = ref.sum()
+    zero_obs = npos == 1
+    zero_ref = npos == 2
+    k = zero_obs | zero_ref
+    n_single = min(int(zero_obs.sum()), int(zero_ref.sum()))
+    if n_single > 0:
+        refk = -np.sort(-ref[k])[:n_single]
+        obsk = -np.sort(-obs[k])[:n_single]
+        obs = np.concatenate([obs[~k], obsk])
+        ref = np.concatenate([ref[~k], refk])
+    else:
+        obs, ref = obs[~k], ref[~k]
+    n = obs.size
+    if n == 0:
+        return 1.0
+    obs_p = obs / libsize_obs
+    ref_p = ref / libsize_ref
+    with np.errstate(divide="ignore", invalid="ignore"):
+        M = _log2_libm(obs_p / ref_p)
+        A = 0.5 * _log2_libm(obs_p * ref_p)
+        if np.max(np.abs(M)) < 1e-6:
+            return 1.0
+        M_shrunk = _log2_libm(((obs + 0.5) / (libsize_obs + 0.5)) / ((ref + 0.5) / (libsize_ref + 0.5)))
+    o_M = np.lexsort((M_shrunk, M))               # R order(M, M.shrunk)
+    o_A = np.argsort(A, kind="stable")           # R order(A)
+    loM = int(n * logratio_trim) + 1
+    hiM = n + 1 - loM
+    keep_M = np.zeros(n, bool)
+    keep_M[o_M[loM - 1:hiM]] = True
+    loA = int(n * sum_trim) + 1
+    hiA = n + 1 - loA
+    keep_A = np.zeros(n, bool)
+    keep_A[o_A[loA - 1:hiA]] = True
+    keep = keep_M & keep_A
+    M = M[keep]
+    if do_weighting:
+        op, rp = obs_p[keep], ref_p[keep]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            v = (1 - op) / op / libsize_obs + (1 - rp) / rp / libsize_ref
+        w = (1 + 1e-6) / (v + 1e-6)
+        tmm = np.sum(w * M) / np.sum(w)
+    else:
+        tmm = np.mean(M)
+    return float(2.0 ** tmm)
 
 
 def effective_lib_sizes(x: DGEList) -> np.ndarray:
@@ -453,7 +581,8 @@ def ave_log_cpm(x, normalized_lib_sizes: bool = True, prior_count: float = 2.0, 
         lib = np.asarray(lib_size if lib_size is not None else counts.sum(axis=0), dtype=float)
         if np.all(counts == 0) and np.max(lib) == 0:
             return np.full(n, (-np.log(n) + np.log(1e6)) / np.log(2))
-        off = np.broadcast_to(np.log(lib), counts.shape)
+        with np.errstate(divide="ignore"):             # empty libraries -> -Inf offsets, as in R
+            off = np.broadcast_to(np.log(lib), counts.shape)
     else:
         off = np.asarray(offset, dtype=float)
         off = np.broadcast_to(off, counts.shape) if off.ndim <= 1 else off
@@ -466,7 +595,9 @@ def ave_log_cpm(x, normalized_lib_sizes: bool = True, prior_count: float = 2.0, 
     W = np.ones_like(counts) if weights is None else np.broadcast_to(np.asarray(weights, dtype=float), counts.shape)
     libs = np.exp(off)
     prior = float(prior_count) * libs / libs.mean(axis=1, keepdims=True)
-    beta = gb.mglm_one_group(counts + prior, np.log(libs + 2 * prior), phi, W, maxit=50, tol=1e-10)
+    with np.errstate(divide="ignore"):
+        log_libs = np.log(libs + 2 * prior)
+    beta = gb.mglm_one_group(counts + prior, log_libs, phi, W, maxit=50, tol=1e-10)
     return (beta + np.log(1e6)) / np.log(2)
 
 
@@ -554,27 +685,38 @@ def estimate_tagwise_disp(object, prior_df: float = 10.0, group=None):
 
 def estimate_disp(
     object,
-    group=None,
-    tagwise: bool = True,
+    design=None,
     prior_df: float | None = None,
     trend_method: str = "locfit",
+    tagwise: bool = True,
+    span: float | None = None,
+    legacy_span: bool = False,
     min_row_sum: float = 5.0,
     grid_length: int = 21,
     grid_range: tuple[float, float] = (-10.0, 10.0),
-    span: float | None = None,
-    legacy_span: bool = False,
-    design=None,
     robust: bool = False,
     winsor_tail_p: tuple[float, float] = (0.05, 0.1),
+    group=None,
 ):
-    """Classic ``estimateDisp`` workflow.
+    """edgeR ``estimateDisp``: common, trended and tagwise NB dispersions.
 
-    Current coverage targets the classic no-design path with
-    ``trend_method`` values ``'none'``, ``'movingave'``, ``'loess'`` and
-    ``'locfit'``. It uses edgeR's conditional likelihood grid and
-    weighted-likelihood empirical Bayes shrinkage for tagwise dispersions. GLM
-    design-based dispersion estimation is implemented for ``trend_method='none'``.
+    Arguments follow edgeR's order, so ``estimateDisp(y, design)`` works as in R.
+    With a design the Cox-Reid adjusted profile likelihood is used (GLM branch);
+    without one, the classic conditional likelihood on pseudo-counts (one-way
+    layout given by ``group`` or ``y.samples['group']``). ``trend_method`` is
+    one of ``'none'``, ``'movingave'``, ``'loess'``, ``'locfit'`` and
+    ``'locfit.mixed'``.
     """
+    import warnings
+    if design is not None and not isinstance(design, pd.DataFrame) and np.ndim(design) == 1:
+        # pyedger <= 0.2.2 took ``group`` as the second positional argument
+        warnings.warn("estimate_disp(y, group) is deprecated: the second argument is the design matrix, as in edgeR; "
+                      "pass group=... by keyword.", FutureWarning, stacklevel=2)
+        design, group = None, design
+    if isinstance(prior_df, (bool, np.bool_)):
+        warnings.warn("estimate_disp(y, group, tagwise) is deprecated: the third argument is prior_df, as in edgeR; "
+                      "pass tagwise=... by keyword.", FutureWarning, stacklevel=2)
+        tagwise, prior_df = bool(prior_df), None
 
     if not isinstance(object, DGEList):
         object = DGEList(object, group=group)
@@ -983,12 +1125,11 @@ def glm_fit(
     )
 
 
-def _fit_glm_batch(counts, X, offset_mat, phi_mat, W, start=None):
+def _fit_glm_batch(counts, X, offset_mat, phi_mat, W, start=None, deviance=True):
     """edgeR glmFit.default core: one-way shortcut or Levenberg, all genes at once."""
     from . import _glm_batch as gb
     if gb.is_one_way(X):
-        beta, mu = gb.mglm_one_way(counts, X, offset_mat, phi_mat, W, start=start)
-        dev = gb.nb_deviance(counts, mu, phi_mat, W)
+        beta, mu, dev = gb.fit_one_way(counts, X, offset_mat, phi_mat, W, start=start, deviance=deviance)
     else:
         if start is None:
             start = gb.levenberg_start(counts, offset_mat, phi_mat, W, X)
@@ -1911,6 +2052,8 @@ def _group_levels(group) -> list:
 
 
 def _resolve_dispersion(x: DGEList, dispersion):
+    if not (dispersion is None or isinstance(dispersion, str)):
+        return dispersion                       # numeric: scalar or one value per gene, as in edgeR
     if dispersion is None or dispersion == "auto":
         if x.tagwise_dispersion is not None:
             return x.tagwise_dispersion
@@ -2034,10 +2177,18 @@ def _design_adjusted_profile_loglik_grid(
                 continue
         cy, co, cw = y[np.ix_(subg, nz)], offset_mat[np.ix_(subg, nz)], W[np.ix_(subg, nz)]
         last = None
+        lgy1 = special.gammaln(cy * cw + 1)      # dispersion-free term of the APL, shared by the grid
+        if gb.is_one_way(redesign) and np.all(cw == 1):
+            fitter = gb.OneWayFitter(cy, redesign, co)
+            for j, disp in enumerate(spline_disp):
+                beta, mu, log_mu = fitter.fit(disp, start=last)
+                last = beta
+                l0[subg, j] = gb.compute_apl_one_disp(cy, mu, log_mu, disp, redesign, lgy1)
+            continue
         for j, disp in enumerate(spline_disp):
             phi = np.full_like(cy, disp)
-            last, mu, _ = _fit_glm_batch(cy, redesign, co, phi, cw, start=last)
-            l0[subg, j] = gb.compute_apl(cy, mu, phi, cw, redesign)
+            last, mu, _ = _fit_glm_batch(cy, redesign, co, phi, cw, start=last, deviance=False)   # APL needs mu only
+            l0[subg, j] = gb.compute_apl(cy, mu, phi, cw, redesign, lgamma_y1=lgy1)
     return theta, l0
 
 
@@ -2166,8 +2317,156 @@ def _locfit_by_col(
     return locfit_by_col(y, x=x, weights=weights, span=span, degree=degree)
 
 
+# Regularised incomplete gamma in log space (R's pgamma/qgamma with log.p = TRUE).
+# SciPy has no log-scale versions; its gammainc/gammaincc underflow to 0 in the far
+# tails, which made log(p) = -inf and the inverse +inf. Where the tail probability
+# is representable SciPy is used; below _LOG_TINY the logarithm is computed directly
+# (series for the lower tail, Lentz continued fraction for the upper tail) and the
+# quantile is found by Newton steps on log(q). All of it is vectorised over elements.
+_LOG_TINY = -460.0          # exp(-460) ~ 1e-200
+
+
+def _log_gamma_series(x, a):
+    """log P(a, x) = a log x - x - lgamma(a + 1) + log(sum_k x^k / ((a+1)...(a+k))), for x < a + 1."""
+    total = np.ones_like(x)
+    term = np.ones_like(x)
+    act = np.arange(x.size)
+    k = 0
+    while act.size and k < 100000:
+        k += 1
+        term[act] *= x[act] / (a[act] + k)
+        total[act] += term[act]
+        act = act[~(term[act] < total[act] * 1e-17)]
+    return a * np.log(x) - x - special.gammaln(a + 1.0) + np.log(total)
+
+
+def _log_gamma_cf(x, a):
+    """log Q(a, x) by the modified Lentz continued fraction (Numerical Recipes gcf), for x > a + 1."""
+    tiny = 1e-300
+    b = x + 1.0 - a
+    c = np.full_like(x, 1.0 / tiny)
+    d = 1.0 / b
+    h = d.copy()
+    act = np.arange(x.size)
+    i = 0
+    while act.size and i < 100000:
+        i += 1
+        an = -i * (i - a[act])
+        b[act] += 2.0
+        dd = an * d[act] + b[act]
+        dd = np.where(np.abs(dd) < tiny, tiny, dd)
+        cc = b[act] + an / c[act]
+        cc = np.where(np.abs(cc) < tiny, tiny, cc)
+        d[act] = 1.0 / dd
+        c[act] = cc
+        delta = d[act] * cc
+        h[act] *= delta
+        act = act[~(np.abs(delta - 1.0) < 1e-16)]
+    return a * np.log(x) - x - special.gammaln(a) + np.log(h)
+
+
+def _log_pgamma_tail(x, a, upper):
+    """log of the requested tail where it underflows; x, a are 1-D."""
+    out = np.full(x.shape, -np.inf)
+    if upper:
+        use = x > a + 1.0
+        out[use] = _log_gamma_cf(x[use], a[use])
+    else:
+        use = (x > 0) & (x < a + 1.0)
+        out[use] = _log_gamma_series(x[use], a[use])
+    return out
+
+
+def _log_pgamma(x, a, upper):
+    x, a = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(a, dtype=float))
+    p = special.gammaincc(a, x) if upper else special.gammainc(a, x)
+    with np.errstate(divide="ignore"):
+        out = np.log(p)
+    near_one = p > 0.5                    # log(1 - other tail) keeps the digits log(p) loses near 1
+    if near_one.any():
+        xa, aa = x[near_one], a[near_one]
+        out[near_one] = np.log1p(-(special.gammainc(aa, xa) if upper else special.gammaincc(aa, xa)))
+    tail = ~(out > _LOG_TINY) & (x > 0)   # x == 0: lower tail is exactly -inf, upper is 0
+    if tail.any():
+        t = _log_pgamma_tail(x[tail], a[tail], upper)
+        out[tail] = np.where(np.isfinite(t), t, out[tail])
+    return out
+
+
+def _qgamma_log_tail(lp, a, upper):
+    """Quantile q with log P(a, q) = lp (lower) or log Q(a, q) = lp (upper), lp < _LOG_TINY; 1-D."""
+    lg_a = special.gammaln(a)
+    if upper:   # log Q ~ (a - 1) log q - q - lgamma(a): start from q = -lp and correct
+        q0 = -lp
+        t = np.log(np.maximum(q0 + (a - 1.0) * np.log(q0) - lg_a, a + 2.0))
+    else:       # log P ~ a log q - lgamma(a + 1)
+        t = (lp + special.gammaln(a + 1.0)) / a
+    # the root lies where the expansion used by _log_pgamma_tail is valid: keep t on that side of log(a + 1)
+    edge = np.log(a + 1.0)
+    t = np.maximum(t, edge + 1e-12) if upper else np.minimum(t, edge - 1e-12)
+    act = np.arange(lp.size)
+    for _ in range(100):
+        if not act.size:
+            break
+        q = np.exp(t[act])
+        lpq = _log_pgamma_tail(q, a[act], upper)
+        # d log P / d log q = q f(q) / P, with log(q f(q)) = a log q - q - lgamma(a)
+        with np.errstate(over="ignore", invalid="ignore"):
+            slope = np.exp(a[act] * t[act] - q - lg_a[act] - lpq)
+            step = (lpq - lp[act]) / (-slope if upper else slope)
+        step = np.clip(np.nan_to_num(step, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
+        t[act] -= step
+        t[act] = np.maximum(t[act], edge[act] + 1e-12) if upper else np.minimum(t[act], edge[act] - 1e-12)
+        act = act[~(np.abs(step) < 1e-15 * np.maximum(1.0, np.abs(t[act])))]
+    return np.exp(t)
+
+
+def _qgamma_log(lp, a, upper):
+    lp, a = np.broadcast_arrays(np.asarray(lp, dtype=float), np.asarray(a, dtype=float))
+    out = np.empty(lp.shape)
+    near_one = lp > -math.log(2.0)
+    far = ~near_one
+    with np.errstate(over="ignore", under="ignore"):
+        # the other tail's probability, -expm1(lp), is exact when p is close to 1
+        if near_one.any():
+            q_other = -np.expm1(lp[near_one])
+            out[near_one] = (special.gammaincinv if upper else special.gammainccinv)(a[near_one], q_other)
+        if far.any():
+            out[far] = (special.gammainccinv if upper else special.gammaincinv)(a[far], np.exp(lp[far]))
+    out[lp == -np.inf] = np.inf if upper else 0.0
+    tail = (lp <= _LOG_TINY) & np.isfinite(lp)
+    if tail.any():
+        out[tail] = _qgamma_log_tail(lp[tail], a[tail], upper)
+    return out
+
+
+def _n_threads() -> int:
+    from ._glm_batch import n_threads
+    return n_threads()
+
+
 def q2qnbinom(x, input_mean, output_mean, dispersion=0):
-    """Approximate edgeR ``q2qnbinom`` mapping between NB distributions."""
+    """edgeR ``q2qnbinom``: quantile-to-quantile mapping between NB distributions.
+
+    Large inputs are split by rows over threads (SciPy's special functions
+    release the GIL); every row is computed exactly as in a single call.
+    """
+    x = np.asarray(x, dtype=float)
+    nt = _n_threads()
+    if nt == 1 or x.ndim != 2 or x.size < 200_000:
+        return _q2qnbinom_block(x, input_mean, output_mean, dispersion)
+    from concurrent.futures import ThreadPoolExecutor
+    im = np.broadcast_to(np.asarray(input_mean, dtype=float), x.shape)
+    om = np.broadcast_to(np.asarray(output_mean, dtype=float), x.shape)
+    disp = np.asarray(dispersion, dtype=float)
+    disp = np.full(x.shape[0], float(disp)) if disp.ndim == 0 else disp
+    parts = np.array_split(np.arange(x.shape[0]), nt * 4)
+    with ThreadPoolExecutor(nt) as ex:
+        res = list(ex.map(lambda r: _q2qnbinom_block(x[r], im[r], om[r], disp[r]), parts))
+    return np.concatenate(res, axis=0)
+
+
+def _q2qnbinom_block(x, input_mean, output_mean, dispersion=0):
 
     x = np.asarray(x, dtype=float)
     input_mean = np.asarray(input_mean, dtype=float).copy()
@@ -2199,55 +2498,58 @@ def q2qnbinom(x, input_mean, output_mean, dispersion=0):
     if np.any(above):
         a = above
         p1[a] = special.log_ndtr(-(x[a] - input_mean[a]) / sdi[a])                       # pnorm(upper, log)
-        p2[a] = np.log(special.gammaincc(input_mean[a] / ri[a], x[a] / ri[a]))           # pgamma(upper, log)
+        p2[a] = _log_pgamma(x[a] / ri[a], input_mean[a] / ri[a], upper=True)           # pgamma(upper, log)
         q1[a] = output_mean[a] - sdo[a] * special.ndtri_exp(p1[a])                       # qnorm(upper, log)
-        q2[a] = special.gammainccinv(output_mean[a] / ro[a], np.exp(p2[a])) * ro[a]      # qgamma(upper, log)
+        q2[a] = _qgamma_log(p2[a], output_mean[a] / ro[a], upper=True) * ro[a]          # qgamma(upper, log)
     below = ~above
     if np.any(below):
         b = below
         p1[b] = special.log_ndtr((x[b] - input_mean[b]) / sdi[b])
-        p2[b] = np.log(special.gammainc(input_mean[b] / ri[b], x[b] / ri[b]))
+        p2[b] = _log_pgamma(x[b] / ri[b], input_mean[b] / ri[b], upper=False)
         q1[b] = output_mean[b] + sdo[b] * special.ndtri_exp(p1[b])
-        q2[b] = special.gammaincinv(output_mean[b] / ro[b], np.exp(p2[b])) * ro[b]
+        q2[b] = _qgamma_log(p2[b], output_mean[b] / ro[b], upper=False) * ro[b]
     out = (q1 + q2) / 2.0
     return out
 
 
 def _exact_test_double_tail(y1: np.ndarray, y2: np.ndarray, dispersion: np.ndarray, big_count: int = 900) -> np.ndarray:
+    """edgeR exactTestDoubleTail; the tail sums of all genes are evaluated in a few batched pmf calls."""
     raw_s1 = y1.sum(axis=1)
     raw_s2 = y2.sum(axis=1)
-    s1 = np.rint(raw_s1).astype(int)
-    s2 = np.rint(raw_s2).astype(int)
+    s1 = np.rint(raw_s1).astype(np.int64)
+    s2 = np.rint(raw_s2).astype(np.int64)
     n1 = y1.shape[1]
     n2 = y2.shape[1]
     total = s1 + s2
+    disp = np.asarray(dispersion, dtype=float)
     pvals = np.ones(y1.shape[0], dtype=float)
-    for i, (a, b, s, disp) in enumerate(zip(s1, s2, total, dispersion)):
-        if s == 0:
-            pvals[i] = 1.0
+    pois = (disp <= 0) & (total > 0)
+    for i in np.flatnonzero(pois):
+        pvals[i] = stats.binomtest(int(s1[i]), n=int(total[i]), p=n1 / (n1 + n2)).pvalue
+    big = (s1 > big_count) & (s2 > big_count) & ~pois & (total > 0)
+    for i in np.flatnonzero(big):
+        pvals[i] = _exact_test_beta_approx_row(raw_s1[i], raw_s2[i], n1, n2, disp[i])
+    mu = total / (n1 + n2)
+    mu1, mu2 = n1 * mu, n2 * mu
+    todo = np.flatnonzero((total > 0) & ~pois & ~big & (s1 != mu1))
+    for chunk in np.array_split(todo, max(1, todo.size // 2000)):
+        if not chunk.size:
             continue
-        if disp <= 0:
-            pvals[i] = stats.binomtest(a, n=s, p=n1 / (n1 + n2)).pvalue
-            continue
-        if a > big_count and b > big_count:
-            pvals[i] = _exact_test_beta_approx_row(raw_s1[i], raw_s2[i], n1, n2, disp)
-            continue
-        mu = s / (n1 + n2)
-        mu1 = n1 * mu
-        mu2 = n2 * mu
-        if a == mu1:
-            pvals[i] = 1.0
-            continue
-        size1 = n1 / disp
-        size2 = n2 / disp
-        size_total = (n1 + n2) / disp
-        if a < mu1:
-            xs = np.arange(0, a + 1)
-        else:
-            xs = np.arange(a, s + 1)
-        p_top = _nbinom_pmf_mu(xs, size1, mu1) * _nbinom_pmf_mu(s - xs, size2, mu2)
-        p_bot = _nbinom_pmf_mu(s, size_total, s)
-        pvals[i] = min(1.0, 2.0 * np.sum(p_top) / p_bot)
+        left = s1[chunk] < mu1[chunk]
+        a = np.where(left, 0, s1[chunk])
+        b = np.where(left, s1[chunk], total[chunk])
+        # R's a:b runs downwards when a > b (negative pseudo-counts make s1 > s possible)
+        lo, hi = np.minimum(a, b), np.maximum(a, b)
+        length = hi - lo + 1
+        starts = np.concatenate([[0], np.cumsum(length)[:-1]])
+        xs = np.repeat(lo, length) + (np.arange(length.sum()) - np.repeat(starts, length))
+        d = np.repeat(disp[chunk], length)
+        s_rep = np.repeat(total[chunk], length)
+        p_top = (_nbinom_pmf_mu(xs, n1 / d, np.repeat(mu1[chunk], length))
+                 * _nbinom_pmf_mu(s_rep - xs, n2 / d, np.repeat(mu2[chunk], length)))
+        p_bot = _nbinom_pmf_mu(total[chunk], (n1 + n2) / disp[chunk], total[chunk].astype(float))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pvals[chunk] = np.minimum(1.0, 2.0 * np.add.reduceat(p_top, starts) / p_bot)
     return pvals
 
 

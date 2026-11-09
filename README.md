@@ -13,37 +13,50 @@ A **pure-Python port of [Bioconductor edgeR](https://bioconductor.org/packages/r
 ## Install
 
 ```bash
-pip install pyedger          # NumPy implementation
-pip install "pyedger[fast]"  # + numba kernels (several times faster, parallel over genes)
+pip install pyedger
 ```
+
+Genes are processed in parallel; the number of threads follows numba's `NUMBA_NUM_THREADS` (or
+`PYEDGER_NUM_THREADS`). Results do not depend on it.
 
 ## Quick start
 
+The calls mirror an edgeR script line by line.
+
 ```python
 import numpy as np
+import pandas as pd
 import pyedger
 
-# counts: genes x samples raw count matrix; group: per-sample condition labels
-dge = pyedger.DGEList(counts=counts, group=group)
-dge = pyedger.calcNormFactors(dge)                       # TMM normalization
-keep = pyedger.filterByExpr(dge, group=group)
-dge = dge[keep]
+# counts: genes x samples DataFrame of raw counts; group: one label per sample
+group = pd.Categorical(group, categories=["control", "treated"])   # first level = reference
+y = pyedger.DGEList(counts, group=group)
+keep = pyedger.filterByExpr(y)
+y = y.subset(keep, keep_lib_sizes=False)        # R: y[keep, , keep.lib.sizes = FALSE]
+y = pyedger.normLibSizes(y)                      # TMM
 
-# Quasi-likelihood F-test workflow (the recommended edgeR pipeline)
-dge = pyedger.estimateDisp(dge, design)
-fit = pyedger.glmQLFit(dge, design)
-qlf = pyedger.glmQLFTest(fit, coef=1)
+design = np.column_stack([np.ones(len(group)), group == "treated"]).astype(float)   # ~ group
+y = pyedger.estimateDisp(y, design)
+
+# Quasi-likelihood F-test (the recommended edgeR pipeline)
+fit = pyedger.glmQLFit(y, design)
+qlf = pyedger.glmQLFTest(fit, coef=1)            # 0-based: R's coef = 2
 res = pyedger.topTags(qlf, n=np.inf)
-res.head()
 ```
 
 ### Classic exact test
 
 ```python
-dge = pyedger.estimateDisp(dge, design)
-et = pyedger.exactTest(dge, pair=("control", "treated"))
+y = pyedger.estimateDisp(y)                      # classic mode, no design
+et = pyedger.exactTest(y, pair=("control", "treated"))
 pyedger.topTags(et)
 ```
+
+### Differences from R to keep in mind
+
+- Coefficients are 0-based (`coef=1` is R's `coef = 2`); coefficient names are also accepted.
+- `y[keep]` keeps the original library sizes, as R's default does; use `y.subset(keep, keep_lib_sizes=False)` for `keep.lib.sizes = FALSE`.
+- pyedger 0.2.x tracks edgeR 4.10.5. Results from edgeR < 4.2 differ (new QL method); `glmQLFit(legacy=True)` gives the classic one.
 
 ## API
 
